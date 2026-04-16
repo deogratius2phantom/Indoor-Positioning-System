@@ -45,7 +45,6 @@ async def process_loop(queue: asyncio.Queue[dict], config_path: Path) -> None:
                     timestamp = candidate
             except (TypeError, ValueError):
                 print(f"Invalid ts_ms value in message: {message!r}")
-                pass
 
         try:
             reading = Reading(

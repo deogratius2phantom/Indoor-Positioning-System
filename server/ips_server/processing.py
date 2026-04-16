@@ -34,7 +34,7 @@ class RSSIWindowProcessor:
     def _evict_expired(self) -> None:
         cutoff = time.time() - self.window_seconds
         empty_macs: List[str] = []
-        for mac, readings in list(self._store.items()):
+        for mac, readings in self._store.items():
             filtered = {
                 node_id: reading
                 for node_id, reading in readings.items()
