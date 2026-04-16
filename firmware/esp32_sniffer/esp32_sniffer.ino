@@ -2,7 +2,7 @@
 #include <WiFiUdp.h>
 #include <esp_wifi.h>
 
-// Update these values for your local network.
+// Placeholder values. Replace with local credentials and avoid committing real secrets.
 constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
 constexpr char WIFI_PASSWORD[] = "YOUR_WIFI_PASSWORD";
 constexpr char NODE_ID[] = "node_1";

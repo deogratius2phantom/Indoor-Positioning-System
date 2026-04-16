@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -19,7 +19,7 @@ class RSSIModel:
 
 
 class TrilaterationSolver:
-    def __init__(self, node_positions: Dict[str, Tuple[float, float, float]], model: RSSIModel | None = None):
+    def __init__(self, node_positions: Dict[str, Tuple[float, float, float]], model: Optional[RSSIModel] = None):
         self.node_positions = node_positions
         self.model = model or RSSIModel()
 

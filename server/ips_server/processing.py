@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class RSSIWindowProcessor:
 
     def _evict_expired(self) -> None:
         cutoff = time.time() - self.window_seconds
-        empty_macs: list[str] = []
+        empty_macs: List[str] = []
         for mac, readings in list(self._store.items()):
             filtered = {
                 node_id: reading

@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Any, Tuple
 
 import numpy as np
 
@@ -17,7 +18,7 @@ class UDPCollectorProtocol(asyncio.DatagramProtocol):
     def __init__(self, queue: asyncio.Queue[dict]):
         self.queue = queue
 
-    def datagram_received(self, data: bytes, addr):
+    def datagram_received(self, data: bytes, addr: Tuple[Any, int]) -> None:
         try:
             message = json.loads(data.decode("utf-8"))
             self.queue.put_nowait(message)
