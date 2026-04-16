@@ -10,6 +10,8 @@ from ips_server.kalman import PositionKalmanFilter
 from ips_server.processing import RSSIWindowProcessor, Reading
 from ips_server.trilateration import TrilaterationSolver
 
+MIN_EPOCH_TIMESTAMP = 1_000_000_000
+
 
 class UDPCollectorProtocol(asyncio.DatagramProtocol):
     def __init__(self, queue: asyncio.Queue[dict]):
@@ -38,7 +40,7 @@ async def process_loop(queue: asyncio.Queue[dict], config_path: Path) -> None:
             try:
                 candidate = float(message["ts_ms"]) / 1000.0
                 # Use device timestamp when it looks like epoch time.
-                if candidate > 1_000_000_000:
+                if candidate > MIN_EPOCH_TIMESTAMP:
                     timestamp = candidate
             except (TypeError, ValueError):
                 pass

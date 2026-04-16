@@ -2,7 +2,12 @@ import numpy as np
 
 
 class PositionKalmanFilter:
-    """Simple 3D Kalman filter with identity state transition."""
+    """Simple 3D Kalman filter with identity state transition.
+
+    `process_noise` controls how much state change is expected between updates.
+    `measurement_noise` controls trust in observed trilateration coordinates.
+    Increase measurement noise for jittery RSSI environments.
+    """
 
     def __init__(self, process_noise: float = 0.05, measurement_noise: float = 1.0):
         self.state = np.zeros(3)

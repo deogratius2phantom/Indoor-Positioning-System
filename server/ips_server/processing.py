@@ -34,11 +34,14 @@ class RSSIWindowProcessor:
     def _evict_expired(self) -> None:
         cutoff = time.time() - self.window_seconds
         empty_macs: list[str] = []
-        for mac, readings in self._store.items():
-            expired_nodes = [node_id for node_id, reading in readings.items() if reading.timestamp < cutoff]
-            for node_id in expired_nodes:
-                del readings[node_id]
-            if not readings:
+        for mac, readings in list(self._store.items()):
+            filtered = {
+                node_id: reading
+                for node_id, reading in readings.items()
+                if reading.timestamp >= cutoff
+            }
+            self._store[mac] = filtered
+            if not filtered:
                 empty_macs.append(mac)
 
         for mac in empty_macs:
