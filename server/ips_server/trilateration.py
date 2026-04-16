@@ -31,6 +31,7 @@ class TrilaterationSolver:
         anchors = np.array([self.node_positions[node_id] for node_id, _ in active_nodes], dtype=float)
         distances = np.array([self.model.rssi_to_distance(rssi) for _, rssi in active_nodes], dtype=float)
 
+        # Weight by inverse squared distance so stronger/closer anchors influence the initial guess more.
         weights = 1.0 / np.maximum(distances**2, MIN_DISTANCE_SQUARED)
         initial_guess = np.average(anchors, axis=0, weights=weights)
 

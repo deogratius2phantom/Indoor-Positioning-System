@@ -1,2 +1,3 @@
 __pycache__/
 *.pyc
+firmware/esp32_sniffer/wifi_config.h

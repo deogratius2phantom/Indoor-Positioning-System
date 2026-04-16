@@ -44,14 +44,19 @@ async def process_loop(queue: asyncio.Queue[dict], config_path: Path) -> None:
                 if candidate > MIN_EPOCH_TIMESTAMP:
                     timestamp = candidate
             except (TypeError, ValueError):
+                print(f"Invalid ts_ms value in message: {message!r}")
                 pass
 
-        reading = Reading(
-            node_id=message["node_id"],
-            mac=message["mac"],
-            rssi=float(message["rssi"]),
-            timestamp=timestamp,
-        )
+        try:
+            reading = Reading(
+                node_id=message["node_id"],
+                mac=message["mac"],
+                rssi=float(message["rssi"]),
+                timestamp=timestamp,
+            )
+        except (KeyError, TypeError, ValueError):
+            print(f"Invalid payload, skipping message: {message!r}")
+            continue
         processor.add_reading(reading)
 
         for mac, rssi_window in processor.ready_windows().items():

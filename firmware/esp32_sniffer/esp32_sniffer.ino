@@ -146,7 +146,7 @@ void loop() {
   }
 
   const uint32_t now = millis();
-  if (now - lastHop >= kHopIntervalMs) {
+  if (static_cast<uint32_t>(now - lastHop) >= kHopIntervalMs) {
     currentChannel = (currentChannel >= kMaxChannel) ? kMinChannel : (currentChannel + 1);
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     lastHop = now;

@@ -51,6 +51,8 @@ It includes:
 - UDP forwarding to Raspberry Pi
 - Channel hopping on channels 1-13
 
+For safer credential handling, keep real WiFi credentials in a local, untracked file (for example `firmware/esp32_sniffer/wifi_config.h`) instead of committing them.
+
 ## Core Python Trilateration Logic
 
 Core solver is located at:
