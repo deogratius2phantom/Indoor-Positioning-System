@@ -33,11 +33,21 @@ async def process_loop(queue: asyncio.Queue[dict], config_path: Path) -> None:
 
     while True:
         message = await queue.get()
+        timestamp = time.time()
+        if "ts_ms" in message:
+            try:
+                candidate = float(message["ts_ms"]) / 1000.0
+                # Use device timestamp when it looks like epoch time.
+                if candidate > 1_000_000_000:
+                    timestamp = candidate
+            except (TypeError, ValueError):
+                pass
+
         reading = Reading(
             node_id=message["node_id"],
             mac=message["mac"],
             rssi=float(message["rssi"]),
-            timestamp=time.time(),
+            timestamp=timestamp,
         )
         processor.add_reading(reading)
 

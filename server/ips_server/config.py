@@ -10,7 +10,9 @@ def load_config(path: str | Path) -> dict:
 
 
 def node_positions(config: dict) -> Dict[str, Tuple[float, float, float]]:
-    return {
-        node_id: tuple(position)  # type: ignore[arg-type]
-        for node_id, position in config["nodes"].items()
-    }
+    positions: Dict[str, Tuple[float, float, float]] = {}
+    for node_id, position in config["nodes"].items():
+        if not isinstance(position, (list, tuple)) or len(position) != 3:
+            raise ValueError(f"Node '{node_id}' must have exactly 3 coordinates.")
+        positions[node_id] = (float(position[0]), float(position[1]), float(position[2]))
+    return positions

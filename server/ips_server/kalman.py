@@ -22,7 +22,7 @@ class PositionKalmanFilter:
 
         innovation = measurement - predicted_state
         innovation_covariance = predicted_covariance + self.measurement_noise
-        kalman_gain = predicted_covariance @ np.linalg.inv(innovation_covariance)
+        kalman_gain = np.linalg.solve(innovation_covariance.T, predicted_covariance.T).T
 
         self.state = predicted_state + kalman_gain @ innovation
         self.covariance = (np.eye(3) - kalman_gain) @ predicted_covariance

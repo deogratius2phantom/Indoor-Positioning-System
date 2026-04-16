@@ -95,9 +95,18 @@ void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  uint32_t startMs = millis();
+  constexpr uint32_t kConnectTimeoutMs = 15000;
+
   while (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Connecting to WiFi...");
     delay(500);
+    if (millis() - startMs >= kConnectTimeoutMs) {
+      Serial.println("WiFi connection timeout. Restarting...");
+      ESP.restart();
+    }
   }
+  Serial.println("WiFi connected.");
 }
 
 void enablePromiscuousMode() {

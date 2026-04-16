@@ -29,7 +29,8 @@ class TrilaterationSolver:
         anchors = np.array([self.node_positions[node_id] for node_id, _ in active_nodes], dtype=float)
         distances = np.array([self.model.rssi_to_distance(rssi) for _, rssi in active_nodes], dtype=float)
 
-        initial_guess = np.mean(anchors, axis=0)
+        weights = 1.0 / np.maximum(distances**2, 1e-6)
+        initial_guess = np.average(anchors, axis=0, weights=weights)
 
         def residuals(point: Iterable[float]) -> np.ndarray:
             point_array = np.array(point, dtype=float)
