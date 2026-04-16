@@ -40,7 +40,8 @@ class RSSIWindowProcessor:
                 for node_id, reading in readings.items()
                 if reading.timestamp >= cutoff
             }
-            self._store[mac] = filtered
+            if len(filtered) != len(readings):
+                self._store[mac] = filtered
             if not filtered:
                 empty_macs.append(mac)
 

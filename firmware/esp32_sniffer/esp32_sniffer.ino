@@ -133,6 +133,12 @@ void sendUdpRecord(const SniffRecord &record) {
 
 void setup() {
   Serial.begin(115200);
+  if (String(WIFI_SSID) == "YOUR_WIFI_SSID" || String(WIFI_PASSWORD) == "YOUR_WIFI_PASSWORD") {
+    Serial.println("Please set WiFi credentials before flashing.");
+    while (true) {
+      delay(1000);
+    }
+  }
   connectWifi();
   udp.begin(0);
   enablePromiscuousMode();
@@ -146,7 +152,7 @@ void loop() {
   }
 
   const uint32_t now = millis();
-  if (static_cast<uint32_t>(now - lastHop) >= kHopIntervalMs) {
+  if ((now - lastHop) >= kHopIntervalMs) {
     currentChannel = (currentChannel >= kMaxChannel) ? kMinChannel : (currentChannel + 1);
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
     lastHop = now;

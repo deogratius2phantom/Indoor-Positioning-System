@@ -11,6 +11,7 @@ MIN_DISTANCE_SQUARED = 1e-6
 
 @dataclass(frozen=True)
 class RSSIModel:
+    # Tune tx_power_dbm and path_loss_exponent from real calibration data per deployment.
     tx_power_dbm: float = -40.0
     path_loss_exponent: float = 2.0
 

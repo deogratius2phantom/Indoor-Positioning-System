@@ -44,7 +44,7 @@ async def process_loop(queue: asyncio.Queue[dict], config_path: Path) -> None:
                 if candidate > MIN_EPOCH_TIMESTAMP:
                     timestamp = candidate
             except (TypeError, ValueError):
-                print(f"Invalid ts_ms value in message: {message!r}")
+                print(f"Failed to convert ts_ms to valid timestamp in message: {message!r}")
 
         try:
             reading = Reading(
@@ -54,7 +54,7 @@ async def process_loop(queue: asyncio.Queue[dict], config_path: Path) -> None:
                 timestamp=timestamp,
             )
         except (KeyError, TypeError, ValueError):
-            print(f"Invalid payload, skipping message: {message!r}")
+            print(f"Missing/invalid required fields (node_id, mac, rssi) in message: {message!r}")
             continue
         processor.add_reading(reading)
 
