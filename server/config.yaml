@@ -1,6 +1,15 @@
-server:
-  listen_ip: 0.0.0.0
-  listen_port: 5005
+transport:
+  serial:
+    baudrate: 921600
+    ports:
+      - /dev/ttyUSB0
+      - /dev/ttyUSB1
+      - /dev/ttyUSB2
+      - /dev/ttyUSB3
+
+processing:
+  window_ms: 200
+  minimum_nodes: 3
 
 nodes:
   node_1: [0.0, 0.0, 2.0]
