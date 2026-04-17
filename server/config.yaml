@@ -1,0 +1,18 @@
+transport:
+  serial:
+    baudrate: 921600
+    ports:
+      - /dev/ttyUSB0
+      - /dev/ttyUSB1
+      - /dev/ttyUSB2
+      - /dev/ttyUSB3
+
+processing:
+  window_ms: 200
+  minimum_nodes: 3
+
+nodes:
+  node_1: [0.0, 0.0, 2.0]
+  node_2: [10.0, 0.0, 2.0]
+  node_3: [0.0, 10.0, 2.0]
+  node_4: [10.0, 10.0, 2.0]
