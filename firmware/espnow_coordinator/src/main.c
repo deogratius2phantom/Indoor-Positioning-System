@@ -893,13 +893,24 @@ static const char DASHBOARD_HTML[] =
 "setTimeout(()=>m.textContent='',3000);poll();})"
 ".catch(e=>{"
 "document.getElementById('savemsg').textContent='\\u274C '+e.message;});}"
+/* poll(): abort any in-flight request before starting a new one.
+   A 5-second AbortController timeout ensures a hung /data call never
+   silently blocks the status display. */
+"let s_ctl=null;"
 "function poll(){"
-"fetch('/data').then(r=>r.json()).then(d=>{"
+"if(s_ctl){s_ctl.abort();}"
+"s_ctl=new AbortController();"
+"const tid=setTimeout(()=>{if(s_ctl)s_ctl.abort();},5000);"
+"fetch('/data',{signal:s_ctl.signal}).then(r=>r.json()).then(d=>{"
+"clearTimeout(tid);s_ctl=null;"
 "D=d;draw(d);updateTables(d);"
 "document.getElementById('status').textContent='Last update: '+new Date().toLocaleTimeString();"
 "}).catch(e=>{"
-"document.getElementById('status').textContent='Error: '+e;});}"
-"poll();setInterval(poll,2000);"
+"clearTimeout(tid);s_ctl=null;"
+"if(e.name!=='AbortError'){"
+"document.getElementById('status').textContent='Error: '+e;}else{"
+"document.getElementById('status').textContent='Timeout \u2014 retrying...';}});}"
+"poll();setInterval(poll,3000);"
 "</script></body></html>";
 
 /* ================================================================
@@ -909,6 +920,7 @@ static const char DASHBOARD_HTML[] =
 static esp_err_t handler_root(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_send(req, DASHBOARD_HTML, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
