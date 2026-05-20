@@ -916,6 +916,10 @@ static esp_err_t handler_root(httpd_req_t *req)
 static esp_err_t handler_data(httpd_req_t *req)
 {
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
 
     xSemaphoreTake(s_table_mutex, portMAX_DELAY);
 
@@ -980,6 +984,14 @@ static esp_err_t handler_data(httpd_req_t *req)
 
     char *js = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
+    if (!js) {
+        /* Heap exhausted — send an empty-but-valid JSON object so the
+           browser doesn't crash; it will retry on the next 2-second poll. */
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_send(req, "{\"nodes\":[],\"devices\":[]}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     httpd_resp_send(req, js, HTTPD_RESP_USE_STRLEN);
@@ -1065,7 +1077,7 @@ static esp_err_t handler_config(httpd_req_t *req)
 static void start_webserver(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size         = 8192;
+    cfg.stack_size         = 16384;   /* 16 KB — cJSON recursion + httpd internals need >8 KB */
     cfg.max_uri_handlers   = 8;
 
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
