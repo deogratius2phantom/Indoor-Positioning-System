@@ -13,6 +13,8 @@
 #include "nvs_flash.h"
 #include "esp_now.h"
 #include "esp_mac.h"
+#include "driver/rmt_tx.h"
+#include "led_strip_encoder.h"
 
 /* ================================================================
    Configuration
@@ -22,15 +24,43 @@
 #define REPORT_PERIOD_MS  5000     /* duration of each reporting window (5 s)   */
 #define MAX_DEVICES       64
 #define QUEUE_DEPTH       32
-#define SYNC_QUEUE_DEPTH  4        /* sync epochs queue up rarely               */
-#define MGMT_HDR_LEN      24       /* fixed part of 802.11 management header    */
-#define STALE_MS          30000    /* evict device entries unseen for 30 s      */
-#define RSSI_REF_DBM      (-40)    /* reference RSSI at 1 m                     */
-#define PATH_LOSS_N       2.5f     /* indoor path-loss exponent                 */
+#define SYNC_QUEUE_DEPTH  4
+#define MGMT_HDR_LEN      24
+#define STALE_MS          30000
+#define RSSI_REF_DBM      (-40)
+#define PATH_LOSS_N       2.5f
 
-/* Coordinator MAC — replace with actual coordinator MAC once known.
-   Default 0xFF×6 = broadcast, works for single-node testing.          */
+/* Coordinator MAC — replace with actual coordinator MAC once known. */
 static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x6F, 0x61, 0x94};
+
+/* ================================================================
+   RGB LED Configuration  (ESP32-C3-DevKitM-1: WS2812 on GPIO 8)
+   ================================================================ */
+
+#define LED_GPIO          8
+#define LED_RMT_RES_HZ    10000000   /* 10 MHz = 100 ns/tick, suits WS2812 */
+
+/*  Steady colours (dim — easy on the eyes)
+    WS2812 wire order is G-R-B; set_led() handles the swap.           */
+#define LED_STEADY_R_RED   50    /* red   = no sync yet                  */
+#define LED_STEADY_G_RED   0
+#define LED_STEADY_B_RED   0
+
+#define LED_STEADY_R_BLUE  0    /* blue  = sync valid, idle              */
+#define LED_STEADY_G_BLUE  0
+#define LED_STEADY_B_BLUE  50
+
+/*  Flash colours (brighter, short duration)                           */
+#define LED_FLASH_R_GREEN  0    /* green = sync epoch received  (500 ms) */
+#define LED_FLASH_G_GREEN  100
+#define LED_FLASH_B_GREEN  0
+
+#define LED_FLASH_R_WHITE  80   /* white = ESP-NOW packet sent  (150 ms) */
+#define LED_FLASH_G_WHITE  80
+#define LED_FLASH_B_WHITE  80
+
+#define LED_FLASH_SYNC_MS  500
+#define LED_FLASH_TX_MS    150
 
 /* ================================================================
    Message types — MUST match espnow_coordinator
@@ -44,34 +74,31 @@ static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x6F, 0x61, 0x94};
    Wire structures (packed — shared between coordinator & sniffer)
    ================================================================ */
 
-/* Coordinator → all nodes (broadcast) */
 typedef struct {
-    uint8_t  msg_type;       /* MSG_SYNC_EPOCH                              */
-    uint32_t epoch_id;       /* monotonically increasing counter            */
-    uint32_t coord_T1_ms;    /* coordinator clock at the moment of send     */
+    uint8_t  msg_type;
+    uint32_t epoch_id;
+    uint32_t coord_T1_ms;
 } __attribute__((packed)) sync_epoch_t;
 
-/* Node → coordinator */
 typedef struct {
-    uint8_t  msg_type;       /* MSG_SYNC_ACK                                */
-    uint32_t epoch_id;       /* echoed from SYNC_EPOCH                      */
-    uint32_t coord_T1_ms;    /* echoed coordinator T1                       */
-    uint32_t node_T2_ms;     /* node local clock at reception of epoch      */
-    uint32_t node_T3_ms;     /* node local clock at moment ACK is sent      */
+    uint8_t  msg_type;
+    uint32_t epoch_id;
+    uint32_t coord_T1_ms;
+    uint32_t node_T2_ms;
+    uint32_t node_T3_ms;
 } __attribute__((packed)) sync_ack_t;
 
-/* Node → coordinator (per-device RSSI snapshot) */
 typedef struct {
-    uint8_t  msg_type;            /* MSG_RSSI_REPORT                        */
-    uint8_t  sender_mac[6];       /* this sensor node's WiFi STA MAC        */
-    uint8_t  target_mac[6];       /* sniffed device MAC                     */
+    uint8_t  msg_type;
+    uint8_t  sender_mac[6];
+    uint8_t  target_mac[6];
     int8_t   avg_rssi;
     uint8_t  best_channel;
     uint32_t pkt_count;
     char     ssid[33];
-    uint8_t  is_random;           /* 1 = locally-administered (random) MAC  */
-    uint32_t window_id;           /* epoch-aligned reporting window counter  */
-    uint32_t node_timestamp_ms;   /* node local clock when window closed     */
+    uint8_t  is_random;
+    uint32_t window_id;
+    uint32_t node_timestamp_ms;
 } __attribute__((packed)) rssi_report_t;
 
 /* ================================================================
@@ -100,11 +127,21 @@ typedef struct {
     char    ssid[33];
 } pkt_info_t;
 
-/* Carries a SYNC_EPOCH + the local reception timestamp through the queue */
 typedef struct {
     sync_epoch_t epoch;
-    uint32_t     recv_T2_ms; /* node local clock captured in the recv callback */
+    uint32_t     recv_T2_ms;
 } epoch_envelope_t;
+
+/* ================================================================
+   LED command type
+   ================================================================ */
+
+typedef enum {
+    LED_CMD_NO_SYNC    = 0,   /* base → red  (no sync received yet)       */
+    LED_CMD_SYNC_VALID,       /* base → blue (sync valid, normal op)       */
+    LED_CMD_FLASH_SYNC,       /* green flash for LED_FLASH_SYNC_MS         */
+    LED_CMD_FLASH_TX,         /* white flash for LED_FLASH_TX_MS           */
+} led_cmd_t;
 
 /* ================================================================
    Globals
@@ -115,14 +152,17 @@ static uint8_t           s_device_count = 0;
 static SemaphoreHandle_t s_table_mutex;
 static QueueHandle_t     s_pkt_queue;
 static QueueHandle_t     s_sync_queue;
+static QueueHandle_t     s_led_queue;
 static uint8_t           s_self_mac[6];
 static volatile bool     s_hopper_pause = false;
 
-/* Epoch / time-sync state — written by sync_handler_task, read by reporter.
-   All are volatile; on ESP32, 32-bit aligned reads/writes are atomic.      */
-static volatile uint32_t s_epoch_anchor_ms = 0;  /* local time of last epoch */
+static volatile uint32_t s_epoch_anchor_ms = 0;
 static volatile uint32_t s_epoch_id        = 0;
 static volatile bool     s_epoch_valid     = false;
+
+/* RMT handles — initialised in app_main, used by set_led() */
+static rmt_channel_handle_t s_led_chan    = NULL;
+static rmt_encoder_handle_t s_led_encoder = NULL;
 
 /* ================================================================
    802.11 frame structures
@@ -180,6 +220,92 @@ static void parse_ssid_ie(const uint8_t *payload, uint16_t payload_len, char *ou
 }
 
 /* ================================================================
+   LED helpers
+   ================================================================ */
+
+/* Write one colour to the onboard WS2812.
+   WS2812 wire order is G-R-B; this function accepts plain R-G-B.   */
+static void set_led(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_led_chan || !s_led_encoder) return;
+    uint8_t grb[3] = {g, r, b};
+    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+    rmt_transmit(s_led_chan, s_led_encoder, grb, sizeof(grb), &tx_cfg);
+    rmt_tx_wait_all_done(s_led_chan, pdMS_TO_TICKS(50));
+}
+
+/* LED task — owns all LED state; driven by s_led_queue.
+   Keeps a "base" colour (red or blue) and handles timed colour
+   flashes, reverting to base once the flash duration expires.       */
+static void led_task(void *pvParameters)
+{
+    led_cmd_t cmd;
+    uint8_t base_r = LED_STEADY_R_RED;
+    uint8_t base_g = LED_STEADY_G_RED;
+    uint8_t base_b = LED_STEADY_B_RED;
+    uint32_t flash_end_ms = 0;
+    bool flashing = false;
+
+    set_led(base_r, base_g, base_b);   /* start red — no sync yet */
+
+    while (1) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+        /* Expire any active flash */
+        if (flashing && now_ms >= flash_end_ms) {
+            flashing = false;
+            set_led(base_r, base_g, base_b);
+        }
+
+        /* Block until next command or until the flash needs to expire */
+        TickType_t wait;
+        if (flashing) {
+            uint32_t rem = flash_end_ms - (uint32_t)(esp_timer_get_time() / 1000ULL);
+            wait = pdMS_TO_TICKS(rem < 10 ? 10 : rem);
+        } else {
+            wait = portMAX_DELAY;
+        }
+
+        if (xQueueReceive(s_led_queue, &cmd, wait) != pdTRUE) continue;
+
+        now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+        switch (cmd) {
+
+            case LED_CMD_NO_SYNC:
+                base_r = LED_STEADY_R_RED;
+                base_g = LED_STEADY_G_RED;
+                base_b = LED_STEADY_B_RED;
+                if (!flashing) set_led(base_r, base_g, base_b);
+                break;
+
+            case LED_CMD_SYNC_VALID:
+                base_r = LED_STEADY_R_BLUE;
+                base_g = LED_STEADY_G_BLUE;
+                base_b = LED_STEADY_B_BLUE;
+                if (!flashing) set_led(base_r, base_g, base_b);
+                break;
+
+            case LED_CMD_FLASH_SYNC:
+                /* green flash — always overrides a TX flash */
+                set_led(LED_FLASH_R_GREEN, LED_FLASH_G_GREEN, LED_FLASH_B_GREEN);
+                flash_end_ms = now_ms + LED_FLASH_SYNC_MS;
+                flashing = true;
+                break;
+
+            case LED_CMD_FLASH_TX:
+                /* white flash — only if no longer flash is already running */
+                if (!flashing) {
+                    set_led(LED_FLASH_R_WHITE, LED_FLASH_G_WHITE, LED_FLASH_B_WHITE);
+                    flash_end_ms = now_ms + LED_FLASH_TX_MS;
+                    flashing = true;
+                }
+                break;
+        }
+    }
+}
+
+/* ================================================================
    Promiscuous callback (Wi-Fi task context — no alloc, no printf)
    ================================================================ */
 
@@ -190,8 +316,7 @@ static void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t pkt_type)
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
     const ieee80211_hdr_t        *hdr = (const ieee80211_hdr_t *)pkt->payload;
 
-    /* Skip ESP-NOW action frames (type=0, subtype=13) so we don't track
-       our own reports or coordinator replies as sniffed devices.          */
+    /* Skip ESP-NOW action frames so we don't log our own transmissions */
     if (hdr->frame_ctrl.type == 0 && (hdr->frame_ctrl.subtype & 0x0F) == 13) return;
 
     pkt_info_t info;
@@ -222,13 +347,25 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     if (data[0] == MSG_SYNC_EPOCH && len == (int)sizeof(sync_epoch_t)) {
         epoch_envelope_t env;
         memcpy(&env.epoch, data, sizeof(sync_epoch_t));
-        /* Capture reception timestamp immediately before any queueing delay */
         env.recv_T2_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
         BaseType_t woken = pdFALSE;
         xQueueSendFromISR(s_sync_queue, &env, &woken);
         portYIELD_FROM_ISR(woken);
     }
+}
+
+/* ================================================================
+   ESP-NOW send callback — fires after every successful TX.
+   Signals the LED task to show a brief white flash.
+   ================================================================ */
+
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
+{
+    (void)tx_info;
+    (void)status;
+    led_cmd_t cmd = LED_CMD_FLASH_TX;
+    xQueueSend(s_led_queue, &cmd, 0);   /* non-blocking; task context */
 }
 
 /* ================================================================
@@ -278,7 +415,8 @@ static void packet_processor_task(void *pvParameters)
 }
 
 /* ================================================================
-   Sync handler task — processes SYNC_EPOCH messages, sends SYNC_ACK
+   Sync handler task — processes SYNC_EPOCH, sends SYNC_ACK,
+   updates LED to show sync status.
    ================================================================ */
 
 static void sync_handler_task(void *pvParameters)
@@ -289,25 +427,26 @@ static void sync_handler_task(void *pvParameters)
     while (1) {
         if (xQueueReceive(s_sync_queue, &env, portMAX_DELAY) != pdTRUE) continue;
 
-        /* The coordinator retransmits the same epoch_id many times to ensure
-           delivery.  Only process each unique epoch once.                    */
+        /* Skip duplicate retransmissions of the same epoch */
         if (env.epoch.epoch_id == last_processed_epoch) continue;
         last_processed_epoch = env.epoch.epoch_id;
 
         uint32_t T2 = env.recv_T2_ms;
 
-        /* Update the epoch anchor — all nodes receiving the same epoch_id
-           reset their window counter to the same reference point, aligning
-           their 5-second reporting windows across the network.              */
         s_epoch_anchor_ms = T2;
         s_epoch_id        = env.epoch.epoch_id;
         s_epoch_valid     = true;
 
-        /* Switch to the reporting channel and send the ACK so the coordinator
-           can measure the round-trip time and compute our clock offset.      */
+        /* ---- LED: update base to blue, then flash green ---- */
+        led_cmd_t led_blue  = LED_CMD_SYNC_VALID;
+        led_cmd_t led_flash = LED_CMD_FLASH_SYNC;
+        xQueueSend(s_led_queue, &led_blue,  0);
+        xQueueSend(s_led_queue, &led_flash, 0);
+
+        /* Switch to reporting channel and send ACK */
         s_hopper_pause = true;
         esp_wifi_set_channel(REPORT_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(5)); /* let channel settle */
+        vTaskDelay(pdMS_TO_TICKS(5));
 
         sync_ack_t ack = {
             .msg_type    = MSG_SYNC_ACK,
@@ -317,6 +456,7 @@ static void sync_handler_task(void *pvParameters)
             .node_T3_ms  = (uint32_t)(esp_timer_get_time() / 1000ULL),
         };
         esp_now_send(COORDINATOR_MAC, (const uint8_t *)&ack, sizeof(sync_ack_t));
+        /* espnow_send_cb will fire here and flash white for the ACK TX */
 
         s_hopper_pause = false;
 
@@ -328,22 +468,18 @@ static void sync_handler_task(void *pvParameters)
 }
 
 /* ================================================================
-   Device reporter task — epoch-aligned, timestamped RSSI reports
+   Device reporter task — epoch-aligned RSSI reports
    ================================================================ */
 
 static void device_reporter_task(void *pvParameters)
 {
     while (1) {
-        /* Sleep until the next epoch-aligned window boundary so all nodes
-           report the same 5-second slice simultaneously.
-           Falls back to a flat 5 s delay until a sync epoch is received.   */
         uint32_t wait_ms = REPORT_PERIOD_MS;
 
         if (s_epoch_valid) {
             uint32_t now     = (uint32_t)(esp_timer_get_time() / 1000ULL);
             uint32_t elapsed = (now - s_epoch_anchor_ms) % REPORT_PERIOD_MS;
             wait_ms          = REPORT_PERIOD_MS - elapsed;
-            /* Avoid a near-zero sleep immediately after an epoch update */
             if (wait_ms < 100) wait_ms += REPORT_PERIOD_MS;
         }
 
@@ -356,7 +492,6 @@ static void device_reporter_task(void *pvParameters)
 
         xSemaphoreTake(s_table_mutex, portMAX_DELAY);
 
-        /* Evict stale entries (compact array in-place) */
         int i = 0;
         while (i < s_device_count) {
             if ((now_ms - s_devices[i].last_seen_ms) > STALE_MS)
@@ -381,7 +516,6 @@ static void device_reporter_task(void *pvParameters)
                "--------------------------------  "
                "--------  -----  -----  -------\n");
 
-        /* Build ESP-NOW report snapshots (sent outside the mutex) */
         static rssi_report_t reports[MAX_DEVICES];
         int report_count = 0;
 
@@ -419,17 +553,18 @@ static void device_reporter_task(void *pvParameters)
 
         xSemaphoreGive(s_table_mutex);
 
-        /* ---- ESP-NOW reporting window ---- */
+        /* ---- ESP-NOW reporting window ----
+           espnow_send_cb fires after each send and flashes white.    */
         if (report_count > 0) {
             s_hopper_pause = true;
             esp_wifi_set_channel(REPORT_CHANNEL, WIFI_SECOND_CHAN_NONE);
-            vTaskDelay(pdMS_TO_TICKS(10)); /* settle */
+            vTaskDelay(pdMS_TO_TICKS(10));
 
             for (int k = 0; k < report_count; k++) {
                 esp_now_send(COORDINATOR_MAC,
                              (const uint8_t *)&reports[k],
                              sizeof(rssi_report_t));
-                vTaskDelay(pdMS_TO_TICKS(2)); /* avoid flooding coordinator */
+                vTaskDelay(pdMS_TO_TICKS(2));
             }
 
             s_hopper_pause = false;
@@ -459,7 +594,6 @@ static void channel_hop_task(void *pvParameters)
 
 void app_main(void)
 {
-    /* NVS required by WiFi driver */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -469,13 +603,28 @@ void app_main(void)
     s_table_mutex = xSemaphoreCreateMutex();
     s_pkt_queue   = xQueueCreate(QUEUE_DEPTH,      sizeof(pkt_info_t));
     s_sync_queue  = xQueueCreate(SYNC_QUEUE_DEPTH, sizeof(epoch_envelope_t));
+    s_led_queue   = xQueueCreate(8,                sizeof(led_cmd_t));
+
+    /* ---- RMT + WS2812 init ---- */
+    rmt_tx_channel_config_t tx_chan_cfg = {
+        .clk_src           = RMT_CLK_SRC_DEFAULT,
+        .gpio_num          = LED_GPIO,
+        .mem_block_symbols = 64,
+        .resolution_hz     = LED_RMT_RES_HZ,
+        .trans_queue_depth = 4,
+    };
+    rmt_new_tx_channel(&tx_chan_cfg, &s_led_chan);
+
+    led_strip_encoder_config_t enc_cfg = { .resolution = LED_RMT_RES_HZ };
+    rmt_new_led_strip_encoder(&enc_cfg, &s_led_encoder);
+    rmt_enable(s_led_chan);
 
     esp_netif_init();
     esp_event_loop_create_default();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
-    esp_wifi_set_mode(WIFI_MODE_STA);   /* STA required for ESP-NOW */
+    esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_start();
 
     esp_wifi_get_mac(WIFI_IF_STA, s_self_mac);
@@ -483,11 +632,10 @@ void app_main(void)
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
 
-    /* ---- ESP-NOW init ---- */
     esp_now_init();
     esp_now_register_recv_cb(espnow_recv_cb);
+    esp_now_register_send_cb(espnow_send_cb);   /* TX indicator */
 
-    /* Register coordinator as a peer for sending reports and SYNC_ACKs */
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, COORDINATOR_MAC, 6);
     peer.channel = REPORT_CHANNEL;
@@ -505,16 +653,15 @@ void app_main(void)
            REPORT_CHANNEL);
     printf("[*] Hopping channels 1-13, reporting every %d s (epoch-aligned)\n",
            REPORT_PERIOD_MS / 1000);
+    printf("[*] LED: red=no-sync | green-flash=sync-rcvd | blue=synced | white-flash=tx\n");
     printf("[*] Awaiting first sync epoch from coordinator...\n\n");
 
-    /* sync_handler runs at higher priority than the hopper so it can
-       pause hopping and send the ACK without being pre-empted mid-send. */
-    xTaskCreate(packet_processor_task, "pkt_proc",     4096, NULL, 5, NULL);
-    xTaskCreate(sync_handler_task,     "sync_handler", 2048, NULL, 6, NULL);
-    xTaskCreate(device_reporter_task,  "reporter",     4096, NULL, 3, NULL);
-    xTaskCreate(channel_hop_task,      "ch_hop",       2048, NULL, 4, NULL);
+    xTaskCreate(led_task,              "led",         2048, NULL, 7, NULL);
+    xTaskCreate(packet_processor_task, "pkt_proc",    4096, NULL, 5, NULL);
+    xTaskCreate(sync_handler_task,     "sync_handler",2048, NULL, 6, NULL);
+    xTaskCreate(device_reporter_task,  "reporter",    4096, NULL, 3, NULL);
+    xTaskCreate(channel_hop_task,      "ch_hop",      2048, NULL, 4, NULL);
 
-    /* Keep app_main alive — all work done in tasks */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
