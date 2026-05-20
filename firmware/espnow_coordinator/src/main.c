@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +14,10 @@
 #include "esp_now.h"
 #include "esp_mac.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "nvs.h"
+#include "cJSON.h"
 
 static const char *TAG = "coordinator";
 
@@ -31,6 +36,15 @@ static const char *TAG = "coordinator";
 #define SYNC_STARTUP_DURATION_MS 60000  /* duration of the startup burst phase  */
 #define SYNC_BCAST_INTERVAL_MS   500    /* gap between repeated epoch broadcasts */
 #define SYNC_BCAST_COUNT         14
+
+/* Web server / Access Point */
+#define AP_SSID             "IPS-Coordinator"
+#define AP_PASS             "ips12345"
+#define AP_MAX_CONN         4
+
+/* NVS storage for node positions */
+#define NVS_NAMESPACE       "ips"
+#define NVS_KEY_NODEPOS     "node_pos"
 
 /* ================================================================
    Trilateration Configuration
@@ -83,12 +97,11 @@ typedef struct {
     float   y_m;
 } node_position_t;
 
-static const node_position_t NODE_POSITIONS[NUM_NODES_EXPECTED] = {
-    /* { MAC bytes },                   X (m)   Y (m) */
-    { {0x00,0x00,0x00,0x00,0x00,0x01},  0.0f,   0.0f  }, /* Node 1 — origin     */
-    { {0x00,0x00,0x00,0x00,0x00,0x02},  5.0f,   0.0f  }, /* Node 2 — X-axis     */
-    { {0x00,0x00,0x00,0x00,0x00,0x03},  2.5f,   4.0f  }, /* Node 3 — far wall   */
-};
+/* Node physical positions — loaded from NVS at boot, configurable via
+   the web dashboard. Initially empty; coordinator populates as nodes
+   register themselves via the web UI.                                 */
+static node_position_t s_node_positions[MAX_NODES];
+static uint8_t         s_node_pos_count = 0;
 
 /* ================================================================
    Message types — MUST match espnow_sniffer_node
@@ -211,6 +224,7 @@ static QueueHandle_t     s_report_queue;
 static QueueHandle_t     s_ack_queue;
 static volatile uint32_t s_epoch_id = 0;
 static TaskHandle_t      s_sync_task_handle = NULL;   /* for on-demand wake-up */
+static httpd_handle_t    s_httpd = NULL;
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
@@ -553,10 +567,10 @@ static void trilateration_task(void *pvParameters)
             bool all_found = true;
             for (int o = 0; o < NUM_NODES_EXPECTED; o++) {
                 bool found = false;
-                for (int p = 0; p < NUM_NODES_EXPECTED; p++) {
-                    if (memcmp(NODE_POSITIONS[p].mac, te->obs[o].node_mac, 6) == 0) {
-                        px[o] = NODE_POSITIONS[p].x_m;
-                        py[o] = NODE_POSITIONS[p].y_m;
+                for (int p = 0; p < s_node_pos_count; p++) {
+                    if (memcmp(s_node_positions[p].mac, te->obs[o].node_mac, 6) == 0) {
+                        px[o] = s_node_positions[p].x_m;
+                        py[o] = s_node_positions[p].y_m;
                         pd[o] = te->obs[o].distance_m;
                         found = true;
                         break;
@@ -713,6 +727,357 @@ static void display_task(void *pvParameters)
 }
 
 /* ================================================================
+   NVS: persist node positions across reboots
+   ================================================================ */
+
+static void load_node_positions(void)
+{
+    s_node_pos_count = 0;
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return;
+
+    uint8_t count = 0;
+    nvs_get_u8(nvs, "np_count", &count);
+    if (count > MAX_NODES) count = MAX_NODES;
+
+    if (count > 0) {
+        size_t sz = count * sizeof(node_position_t);
+        if (nvs_get_blob(nvs, NVS_KEY_NODEPOS, s_node_positions, &sz) == ESP_OK) {
+            s_node_pos_count = (uint8_t)(sz / sizeof(node_position_t));
+        }
+    }
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Loaded %d node position(s) from NVS", s_node_pos_count);
+}
+
+static void save_node_positions(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return;
+    nvs_set_u8(nvs, "np_count", s_node_pos_count);
+    nvs_set_blob(nvs, NVS_KEY_NODEPOS, s_node_positions,
+                 (size_t)(s_node_pos_count * sizeof(node_position_t)));
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Saved %d node position(s) to NVS", s_node_pos_count);
+}
+
+/* ================================================================
+   Web dashboard HTML — served from flash (RODATA).
+   Single-page app: canvas radar + device table + node config form.
+   Polls /data every 2 s via fetch(); saves positions via POST /config.
+   ================================================================ */
+static const char DASHBOARD_HTML[] =
+"<!DOCTYPE html><html><head>"
+"<meta charset=UTF-8>"
+"<meta name=viewport content='width=device-width,initial-scale=1'>"
+"<title>IPS Dashboard</title>"
+"<style>"
+"body{font-family:sans-serif;margin:0;padding:10px;background:#1a1a2e;color:#eee}"
+"h2{margin:0 0 10px;color:#00d4ff}"
+"canvas{border:1px solid #333;background:#0d1117;display:block;margin:0 auto}"
+".panel{background:#16213e;border-radius:8px;padding:15px;margin:10px 0}"
+"table{width:100%;border-collapse:collapse}"
+"th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #333}"
+"th{color:#00d4ff}"
+"input[type=number]{width:70px;background:#0d1117;color:#eee;"
+"border:1px solid #555;padding:4px;border-radius:4px}"
+"button{background:#00d4ff;color:#000;border:none;padding:8px 20px;"
+"border-radius:4px;cursor:pointer;font-weight:bold}"
+"button:hover{background:#00b8d9}"
+"#status{font-size:12px;color:#888;margin-top:5px}"
+"</style></head><body>"
+"<h2>&#x1F4E1; Indoor Positioning System</h2>"
+"<div class=panel>"
+"<canvas id=radar width=520 height=440></canvas>"
+"<div id=status>Connecting...</div>"
+"</div>"
+"<div class=panel>"
+"<h3 style='margin:0 0 10px;color:#00d4ff'>Tracked Devices</h3>"
+"<table id=devtable>"
+"<tr><th>MAC</th><th>X (m)</th><th>Y (m)</th><th>SSID</th><th>Seen by</th></tr>"
+"</table>"
+"</div>"
+"<div class=panel>"
+"<h3 style='margin:0 0 10px;color:#00d4ff'>Node Positions</h3>"
+"<p style='font-size:12px;color:#888'>Enter each node&rsquo;s position in metres"
+" from the room origin corner, then click Save.</p>"
+"<table id=nodecfg>"
+"<tr><th>#</th><th>MAC</th><th>X (m)</th><th>Y (m)</th><th>Sync</th></tr>"
+"</table>"
+"<br>"
+"<button onclick=saveConfig()>&#x1F4BE; Save Positions</button>"
+"<span id=savemsg style='margin-left:10px;font-size:12px'></span>"
+"</div>"
+"<script>"
+"const CV=document.getElementById('radar'),ctx=CV.getContext('2d');"
+"const PAD=50;let D=null;"
+"function toC(x,y,rw,rh){"
+"return[PAD+x/rw*(CV.width-2*PAD),PAD+(1-y/rh)*(CV.height-2*PAD)];}"
+"function draw(d){"
+"ctx.clearRect(0,0,CV.width,CV.height);"
+"const rw=Math.max(d.room_w||1,1),rh=Math.max(d.room_h||1,1);"
+"ctx.strokeStyle='#1e2a3a';ctx.lineWidth=1;"
+"for(let x=0;x<=Math.ceil(rw);x++){"
+"const[cx]=toC(x,0,rw,rh);"
+"ctx.beginPath();ctx.moveTo(cx,PAD);ctx.lineTo(cx,CV.height-PAD);ctx.stroke();"
+"ctx.fillStyle='#555';ctx.font='11px sans-serif';ctx.textAlign='center';"
+"ctx.fillText(x+'m',cx,CV.height-PAD+16);}"
+"for(let y=0;y<=Math.ceil(rh);y++){"
+"const[,cy]=toC(0,y,rw,rh);"
+"ctx.beginPath();ctx.moveTo(PAD,cy);ctx.lineTo(CV.width-PAD,cy);ctx.stroke();"
+"ctx.fillStyle='#555';ctx.font='11px sans-serif';ctx.textAlign='right';"
+"ctx.fillText(y+'m',PAD-4,cy+4);}"
+"ctx.strokeStyle='#00d4ff';ctx.lineWidth=2;"
+"ctx.strokeRect(PAD,PAD,CV.width-2*PAD,CV.height-2*PAD);"
+"(d.nodes||[]).forEach((n,i)=>{"
+"if(!n.configured)return;"
+"const[cx,cy]=toC(n.x,n.y,rw,rh);"
+"ctx.fillStyle='#00d4ff';ctx.beginPath();ctx.arc(cx,cy,10,0,2*Math.PI);ctx.fill();"
+"ctx.fillStyle='#000';ctx.font='bold 11px sans-serif';ctx.textAlign='center';"
+"ctx.fillText(i+1,cx,cy+4);"
+"ctx.fillStyle='#aef';ctx.font='10px sans-serif';"
+"ctx.fillText(n.mac.slice(-5),cx,cy-14);ctx.textAlign='left';});"
+"const COLS=['#ff6b6b','#ffd93d','#6bcb77','#ff9f43','#ee5a24','#a29bfe','#fd79a8'];"
+"(d.devices||[]).forEach((v,i)=>{"
+"if(!v.valid)return;"
+"const[cx,cy]=toC(v.x,v.y,rw,rh),col=COLS[i%COLS.length];"
+"ctx.fillStyle=col;ctx.beginPath();ctx.arc(cx,cy,7,0,2*Math.PI);ctx.fill();"
+"ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke();"
+"ctx.fillStyle='#fff';ctx.font='9px sans-serif';ctx.textAlign='left';"
+"ctx.fillText(v.mac.slice(-5),cx+10,cy+4);});}"
+"function updateTables(d){"
+"const dt=document.getElementById('devtable');"
+"while(dt.rows.length>1)dt.deleteRow(1);"
+"(d.devices||[]).forEach(v=>{"
+"const r=dt.insertRow();"
+"r.innerHTML='<td>'+v.mac+'</td>'"
+"+'<td>'+(v.valid?v.x.toFixed(2):'--')+'</td>'"
+"+'<td>'+(v.valid?v.y.toFixed(2):'--')+'</td>'"
+"+'<td>'+(v.ssid||'&lt;hidden&gt;')+'</td>'"
+"+'<td>'+v.obs+'/'+(d.nodes||[]).length+'</td>';});"
+"if(!(d.devices||[]).length){"
+"const r=dt.insertRow();"
+"r.innerHTML='<td colspan=5 style=\"color:#666\">No devices positioned yet</td>';}"
+"const nt=document.getElementById('nodecfg');"
+"while(nt.rows.length>1)nt.deleteRow(1);"
+"(d.nodes||[]).forEach((n,i)=>{"
+"const r=nt.insertRow();"
+"r.innerHTML='<td>'+(i+1)+'</td>'"
+"+'<td style=\"font-size:11px\">'+n.mac+'</td>'"
+"+'<td><input type=number id=nx'+i+' step=0.1 value='+n.x.toFixed(1)+'></td>'"
+"+'<td><input type=number id=ny'+i+' step=0.1 value='+n.y.toFixed(1)+'></td>'"
+"+'<td style=\"color:'+(n.sync?'#6bcb77':'#ff6b6b')+'\">'+(n.sync?'&#x2705; OK':'&#x23F3; wait')+'</td>';});}"
+"function saveConfig(){"
+"if(!D||!D.nodes)return;"
+"const nodes=D.nodes.map((n,i)=>({"
+"mac:n.mac,"
+"x:parseFloat(document.getElementById('nx'+i)?.value||0),"
+"y:parseFloat(document.getElementById('ny'+i)?.value||0)}));"
+"fetch('/config',{method:'POST',"
+"headers:{'Content-Type':'application/json'},"
+"body:JSON.stringify({nodes})})"
+".then(r=>r.json()).then(r=>{"
+"const m=document.getElementById('savemsg');"
+"m.textContent=r.ok?'\\u2705 Saved!':'\\u274C Error';"
+"setTimeout(()=>m.textContent='',3000);poll();})"
+".catch(e=>{"
+"document.getElementById('savemsg').textContent='\\u274C '+e.message;});}"
+"function poll(){"
+"fetch('/data').then(r=>r.json()).then(d=>{"
+"D=d;draw(d);updateTables(d);"
+"document.getElementById('status').textContent='Last update: '+new Date().toLocaleTimeString();"
+"}).catch(e=>{"
+"document.getElementById('status').textContent='Error: '+e;});}"
+"poll();setInterval(poll,2000);"
+"</script></body></html>";
+
+/* ================================================================
+   HTTP handlers
+   ================================================================ */
+
+static esp_err_t handler_root(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, DASHBOARD_HTML, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t handler_data(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+
+    /* Room bounding box derived from configured positions (+ 10 % margin) */
+    float room_w = 1.0f, room_h = 1.0f;
+    for (int i = 0; i < s_node_pos_count; i++) {
+        if (s_node_positions[i].x_m > room_w) room_w = s_node_positions[i].x_m;
+        if (s_node_positions[i].y_m > room_h) room_h = s_node_positions[i].y_m;
+    }
+    cJSON_AddNumberToObject(root, "room_w", (double)(room_w * 1.1f));
+    cJSON_AddNumberToObject(root, "room_h", (double)(room_h * 1.1f));
+
+    /* Nodes: merge runtime s_nodes[] with stored positions */
+    cJSON *nodes_arr = cJSON_AddArrayToObject(root, "nodes");
+    for (int n = 0; n < s_node_count; n++) {
+        coord_node_t *nd = &s_nodes[n];
+        cJSON *jn = cJSON_CreateObject();
+        char ms[18];
+        snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 nd->node_mac[0], nd->node_mac[1], nd->node_mac[2],
+                 nd->node_mac[3], nd->node_mac[4], nd->node_mac[5]);
+        cJSON_AddStringToObject(jn, "mac", ms);
+        cJSON_AddBoolToObject(jn, "sync", nd->sync_valid);
+        bool configured = false;
+        for (int p = 0; p < s_node_pos_count; p++) {
+            if (memcmp(s_node_positions[p].mac, nd->node_mac, 6) == 0) {
+                cJSON_AddNumberToObject(jn, "x", (double)s_node_positions[p].x_m);
+                cJSON_AddNumberToObject(jn, "y", (double)s_node_positions[p].y_m);
+                configured = true;
+                break;
+            }
+        }
+        if (!configured) {
+            cJSON_AddNumberToObject(jn, "x", 0.0);
+            cJSON_AddNumberToObject(jn, "y", 0.0);
+        }
+        cJSON_AddBoolToObject(jn, "configured", configured);
+        cJSON_AddItemToArray(nodes_arr, jn);
+    }
+
+    /* Devices: trilateration results */
+    cJSON *devices_arr = cJSON_AddArrayToObject(root, "devices");
+    for (int t = 0; t < s_trilat_count; t++) {
+        trilat_device_t *te = &s_trilat_devices[t];
+        cJSON *jd = cJSON_CreateObject();
+        char ms[18];
+        snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 te->target_mac[0], te->target_mac[1], te->target_mac[2],
+                 te->target_mac[3], te->target_mac[4], te->target_mac[5]);
+        cJSON_AddStringToObject(jd, "mac", ms);
+        cJSON_AddStringToObject(jd, "ssid", te->ssid[0] ? te->ssid : "");
+        cJSON_AddBoolToObject(jd, "valid", te->position_valid);
+        cJSON_AddNumberToObject(jd, "x",
+                te->position_valid ? (double)te->est_x_m : 0.0);
+        cJSON_AddNumberToObject(jd, "y",
+                te->position_valid ? (double)te->est_y_m : 0.0);
+        cJSON_AddNumberToObject(jd, "obs", te->obs_count);
+        cJSON_AddItemToArray(devices_arr, jd);
+    }
+
+    xSemaphoreGive(s_table_mutex);
+
+    char *js = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, js, HTTPD_RESP_USE_STRLEN);
+    free(js);
+    return ESP_OK;
+}
+
+static esp_err_t handler_config(httpd_req_t *req)
+{
+    int total = req->content_len;
+    if (total <= 0 || total > 2048) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
+        return ESP_FAIL;
+    }
+    char *buf = malloc(total + 1);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    int received = 0, ret;
+    while (received < total) {
+        ret = httpd_req_recv(req, buf + received, total - received);
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            free(buf);
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    buf[received] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *arr = cJSON_GetObjectItem(root, "nodes");
+    if (cJSON_IsArray(arr)) {
+        xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+        int cnt = cJSON_GetArraySize(arr);
+        for (int i = 0; i < cnt; i++) {
+            cJSON *jn = cJSON_GetArrayItem(arr, i);
+            const char *ms = cJSON_GetStringValue(cJSON_GetObjectItem(jn, "mac"));
+            if (!ms) continue;
+            uint8_t mac[6];
+            if (sscanf(ms, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                       &mac[0], &mac[1], &mac[2],
+                       &mac[3], &mac[4], &mac[5]) != 6) continue;
+            double x = cJSON_GetNumberValue(cJSON_GetObjectItem(jn, "x"));
+            double y = cJSON_GetNumberValue(cJSON_GetObjectItem(jn, "y"));
+            bool found = false;
+            for (int p = 0; p < s_node_pos_count; p++) {
+                if (memcmp(s_node_positions[p].mac, mac, 6) == 0) {
+                    s_node_positions[p].x_m = (float)x;
+                    s_node_positions[p].y_m = (float)y;
+                    found = true; break;
+                }
+            }
+            if (!found && s_node_pos_count < MAX_NODES) {
+                memcpy(s_node_positions[s_node_pos_count].mac, mac, 6);
+                s_node_positions[s_node_pos_count].x_m = (float)x;
+                s_node_positions[s_node_pos_count].y_m = (float)y;
+                s_node_pos_count++;
+            }
+        }
+        xSemaphoreGive(s_table_mutex);
+        save_node_positions();
+    }
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    char *rs = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, rs, HTTPD_RESP_USE_STRLEN);
+    free(rs);
+    return ESP_OK;
+}
+
+static void start_webserver(void)
+{
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.stack_size         = 8192;
+    cfg.max_uri_handlers   = 8;
+
+    if (httpd_start(&s_httpd, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+        return;
+    }
+    static const httpd_uri_t uri_root = {
+        .uri = "/", .method = HTTP_GET, .handler = handler_root
+    };
+    static const httpd_uri_t uri_data = {
+        .uri = "/data", .method = HTTP_GET, .handler = handler_data
+    };
+    static const httpd_uri_t uri_cfg = {
+        .uri = "/config", .method = HTTP_POST, .handler = handler_config
+    };
+    httpd_register_uri_handler(s_httpd, &uri_root);
+    httpd_register_uri_handler(s_httpd, &uri_data);
+    httpd_register_uri_handler(s_httpd, &uri_cfg);
+    ESP_LOGI(TAG, "HTTP dashboard: http://192.168.4.1  (connect to AP '%s')", AP_SSID);
+}
+
+/* ================================================================
    app_main
    ================================================================ */
 
@@ -730,12 +1095,28 @@ void app_main(void)
 
     esp_netif_init();
     esp_event_loop_create_default();
+    esp_netif_create_default_wifi_ap();   /* needed for DHCP on AP interface */
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
-    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+
+    /* Access Point — sniffer nodes and browser clients share channel 1 */
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid           = AP_SSID,
+            .ssid_len       = sizeof(AP_SSID) - 1,
+            .channel        = REPORT_CHANNEL,
+            .password       = AP_PASS,
+            .max_connection = AP_MAX_CONN,
+            .authmode       = WIFI_AUTH_WPA2_PSK,
+        },
+    };
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
     esp_wifi_start();
     esp_wifi_set_channel(REPORT_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    load_node_positions();
 
     uint8_t self_mac[6];
     esp_wifi_get_mac(WIFI_IF_STA, self_mac);
@@ -760,8 +1141,11 @@ void app_main(void)
              SYNC_PERIOD_MS / 1000, SYNC_BCAST_COUNT, SYNC_BCAST_INTERVAL_MS);
     ESP_LOGI(TAG, " Trilat  : RSSI_REF=%d dBm  n=%.1f  nodes=%d",
              RSSI_REF, PATH_LOSS_EXP, NUM_NODES_EXPECTED);
-    ESP_LOGI(TAG, " -> Update NODE_POSITIONS[] with node MACs and room coordinates");
+    ESP_LOGI(TAG, " AP SSID : %s  pass: %s", AP_SSID, AP_PASS);
+    ESP_LOGI(TAG, " Dashboard: http://192.168.4.1");
     ESP_LOGI(TAG, "========================================");
+
+    start_webserver();
 
     xTaskCreate(aggregator_task,     "aggregator", 4096, NULL, 5, NULL);
     xTaskCreate(sync_processor_task, "sync_proc",  4096, NULL, 5, NULL);
