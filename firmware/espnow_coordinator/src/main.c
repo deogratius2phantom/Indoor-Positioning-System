@@ -26,9 +26,11 @@ static const char *TAG = "coordinator";
 #define QUEUE_DEPTH            64      /* incoming report queue depth          */
 #define STALE_MS               60000   /* evict device entries unseen for 60 s */
 #define DISPLAY_PERIOD_MS      10000   /* print aggregated table every 10 s    */
-#define SYNC_PERIOD_MS         30000   /* start a new sync cycle every 30 s    */
-#define SYNC_BCAST_INTERVAL_MS 500     /* gap between repeated epoch broadcasts */
-#define SYNC_BCAST_COUNT       14
+#define SYNC_PERIOD_MS           30000  /* steady-state sync cadence            */
+#define SYNC_STARTUP_PERIOD_MS   3000   /* rapid cadence during first 60 s      */
+#define SYNC_STARTUP_DURATION_MS 60000  /* duration of the startup burst phase  */
+#define SYNC_BCAST_INTERVAL_MS   500    /* gap between repeated epoch broadcasts */
+#define SYNC_BCAST_COUNT         14
 
 /* ================================================================
    Trilateration Configuration
@@ -49,8 +51,11 @@ static const char *TAG = "coordinator";
 /* Run a trilateration pass this often */
 #define TRILAT_PERIOD_MS       5000
 
-/* Accept observations whose window_id differs by at most this much */
-#define WINDOW_TOLERANCE       1
+/* Accept observations whose window_id differs by at most this much.
+   Set to 2 to handle nodes that sync on different broadcasts within
+   the same epoch (up to 7 s apart → at most 1 window difference +
+   one extra slot of margin).                                         */
+#define WINDOW_TOLERANCE       2
 
 /* Exact number of nodes for the algebraic 3-node solver */
 #define NUM_NODES_EXPECTED     3
@@ -92,6 +97,7 @@ static const node_position_t NODE_POSITIONS[NUM_NODES_EXPECTED] = {
 #define MSG_RSSI_REPORT  0x01
 #define MSG_SYNC_EPOCH   0x02
 #define MSG_SYNC_ACK     0x03
+#define MSG_SYNC_REQUEST 0x04   /* Node → coordinator: "please send a sync epoch now" */
 
 /* ================================================================
    Wire structures (packed — shared between coordinator & sniffer)
@@ -101,7 +107,7 @@ static const node_position_t NODE_POSITIONS[NUM_NODES_EXPECTED] = {
 typedef struct {
     uint8_t  msg_type;       /* MSG_SYNC_EPOCH                              */
     uint32_t epoch_id;
-    uint32_t coord_T1_ms;
+    uint32_t coord_T1_ms;    /* captured ONCE per epoch, same in all bcast  */
 } __attribute__((packed)) sync_epoch_t;
 
 /* Node → coordinator */
@@ -112,6 +118,11 @@ typedef struct {
     uint32_t node_T2_ms;
     uint32_t node_T3_ms;
 } __attribute__((packed)) sync_ack_t;
+
+/* Node → coordinator: on-demand sync request */
+typedef struct {
+    uint8_t  msg_type;       /* MSG_SYNC_REQUEST                            */
+} __attribute__((packed)) sync_request_t;
 
 /* Node → coordinator (per-device RSSI snapshot) */
 typedef struct {
@@ -199,6 +210,7 @@ static SemaphoreHandle_t s_table_mutex;
 static QueueHandle_t     s_report_queue;
 static QueueHandle_t     s_ack_queue;
 static volatile uint32_t s_epoch_id = 0;
+static TaskHandle_t      s_sync_task_handle = NULL;   /* for on-demand wake-up */
 
 static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
@@ -291,6 +303,13 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
                 memcpy(env.src_mac, recv_info->src_addr, 6);
                 memcpy(&env.ack, data, sizeof(sync_ack_t));
                 xQueueSendFromISR(s_ack_queue, &env, &woken);
+            }
+            break;
+        case MSG_SYNC_REQUEST:
+            /* A node is asking for an immediate sync broadcast.
+               Wake sync_task early — it will start a new epoch right away. */
+            if (s_sync_task_handle) {
+                vTaskNotifyGiveFromISR(s_sync_task_handle, &woken);
             }
             break;
         default:
@@ -396,24 +415,46 @@ static void sync_processor_task(void *pvParameters)
 
 static void sync_task(void *pvParameters)
 {
+    /* Store task handle so the recv callback can wake us on demand. */
+    s_sync_task_handle = xTaskGetCurrentTaskHandle();
     vTaskDelay(pdMS_TO_TICKS(2000));
+
+    uint32_t start_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
     while (1) {
         s_epoch_id++;
-        ESP_LOGI(TAG, "Sync cycle start  epoch_id=%lu", (unsigned long)s_epoch_id);
+
+        /* Capture T1_base ONCE for the entire epoch.  All SYNC_BCAST_COUNT
+           retransmissions carry this same value so every sniffer — regardless
+           of which broadcast it catches — anchors to the same coordinator
+           reference time, giving aligned window_id values at all nodes.     */
+        uint32_t T1_base = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        ESP_LOGI(TAG, "Sync epoch %lu  T1_base=%lu ms",
+                 (unsigned long)s_epoch_id, (unsigned long)T1_base);
 
         for (int i = 0; i < SYNC_BCAST_COUNT; i++) {
             sync_epoch_t epoch = {
                 .msg_type    = MSG_SYNC_EPOCH,
                 .epoch_id    = s_epoch_id,
-                .coord_T1_ms = (uint32_t)(esp_timer_get_time() / 1000ULL),
+                .coord_T1_ms = T1_base,          /* same for every broadcast */
             };
             esp_now_send(BROADCAST_MAC, (const uint8_t *)&epoch, sizeof(sync_epoch_t));
             vTaskDelay(pdMS_TO_TICKS(SYNC_BCAST_INTERVAL_MS));
         }
 
-        ESP_LOGI(TAG, "Sync cycle done.  Next in %d s", SYNC_PERIOD_MS / 1000);
-        vTaskDelay(pdMS_TO_TICKS(SYNC_PERIOD_MS));
+        /* Startup burst: use a short 3 s cadence for the first 60 s so nodes
+           that boot at any point during that window sync quickly.  After the
+           startup phase, fall back to the steady-state 30 s cadence.        */
+        uint32_t elapsed = (uint32_t)(esp_timer_get_time() / 1000ULL) - start_ms;
+        uint32_t period  = (elapsed < SYNC_STARTUP_DURATION_MS)
+                           ? SYNC_STARTUP_PERIOD_MS : SYNC_PERIOD_MS;
+        ESP_LOGI(TAG, "Sync done. Next in %lu ms  [%s]",
+                 (unsigned long)period,
+                 elapsed < SYNC_STARTUP_DURATION_MS ? "startup burst" : "steady state");
+
+        /* Sleep for the calculated period, but wake immediately if any node
+           sends MSG_SYNC_REQUEST (vTaskNotifyGiveFromISR in recv callback). */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(period));
     }
 }
 

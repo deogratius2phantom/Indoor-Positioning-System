@@ -31,8 +31,7 @@
 #define PATH_LOSS_N       2.5f
 
 /* Coordinator MAC — replace with actual coordinator MAC once known. */
-static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x6F, 0x61, 0x94};
-
+static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x30, 0x97, 0xF8};
 /* ================================================================
    RGB LED Configuration  (ESP32-C3-DevKitM-1: WS2812 on GPIO 8)
    ================================================================ */
@@ -69,6 +68,7 @@ static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x6F, 0x61, 0x94};
 #define MSG_RSSI_REPORT  0x01
 #define MSG_SYNC_EPOCH   0x02
 #define MSG_SYNC_ACK     0x03
+#define MSG_SYNC_REQUEST 0x04   /* Node → coordinator: "please send a sync epoch" */
 
 /* ================================================================
    Wire structures (packed — shared between coordinator & sniffer)
@@ -77,7 +77,7 @@ static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x6F, 0x61, 0x94};
 typedef struct {
     uint8_t  msg_type;
     uint32_t epoch_id;
-    uint32_t coord_T1_ms;
+    uint32_t coord_T1_ms;    /* captured ONCE per epoch, same in all broadcasts */
 } __attribute__((packed)) sync_epoch_t;
 
 typedef struct {
@@ -89,7 +89,7 @@ typedef struct {
 } __attribute__((packed)) sync_ack_t;
 
 typedef struct {
-    uint8_t  msg_type;
+    uint8_t  msg_type;            /* MSG_RSSI_REPORT                        */
     uint8_t  sender_mac[6];
     uint8_t  target_mac[6];
     int8_t   avg_rssi;
@@ -100,6 +100,11 @@ typedef struct {
     uint32_t window_id;
     uint32_t node_timestamp_ms;
 } __attribute__((packed)) rssi_report_t;
+
+/* Node → coordinator: on-demand sync request */
+typedef struct {
+    uint8_t  msg_type;            /* MSG_SYNC_REQUEST                       */
+} __attribute__((packed)) sync_request_t;
 
 /* ================================================================
    Internal sniffer structures
@@ -159,6 +164,11 @@ static volatile bool     s_hopper_pause = false;
 static volatile uint32_t s_epoch_anchor_ms = 0;
 static volatile uint32_t s_epoch_id        = 0;
 static volatile bool     s_epoch_valid     = false;
+/* Approx offset: local_time - coord_time (set on each sync receipt).
+   Used so all nodes compute window_id on the coordinator's time axis,
+   eliminating drift caused by syncing on different epoch broadcasts.  */
+static volatile int32_t  s_clock_offset_ms = 0;
+static volatile uint32_t s_last_sync_ms    = 0;   /* local ms of last sync  */
 
 /* RMT handles — initialised in app_main, used by set_led() */
 static rmt_channel_handle_t s_led_chan    = NULL;
@@ -433,9 +443,19 @@ static void sync_handler_task(void *pvParameters)
 
         uint32_t T2 = env.recv_T2_ms;
 
+        /* Anchor for reporting-window alignment (kept as local reception time) */
         s_epoch_anchor_ms = T2;
         s_epoch_id        = env.epoch.epoch_id;
         s_epoch_valid     = true;
+
+        /* Clock offset: difference between this node's local clock and the
+           coordinator's clock at the moment the epoch was broadcast.
+           offset = T2(local) - T1_base(coordinator).
+           Because all 14 retransmissions carry the same T1_base, nodes that
+           catch any broadcast of the same epoch compute the same coord time,
+           eliminating window_id misalignment across the retransmission span. */
+        s_clock_offset_ms = (int32_t)T2 - (int32_t)env.epoch.coord_T1_ms;
+        s_last_sync_ms    = T2;
 
         /* ---- LED: update base to blue, then flash green ---- */
         led_cmd_t led_blue  = LED_CMD_SYNC_VALID;
@@ -486,8 +506,11 @@ static void device_reporter_task(void *pvParameters)
         vTaskDelay(pdMS_TO_TICKS(wait_ms));
 
         uint32_t now_ms    = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        /* window_id derived from coordinator-referenced time so all nodes
+           produce matching values regardless of which epoch broadcast they
+           caught.  coord_time ≈ local_time - s_clock_offset_ms.            */
         uint32_t window_id = s_epoch_valid
-            ? (now_ms - s_epoch_anchor_ms) / REPORT_PERIOD_MS
+            ? (uint32_t)((int32_t)now_ms - s_clock_offset_ms) / REPORT_PERIOD_MS
             : 0;
 
         xSemaphoreTake(s_table_mutex, portMAX_DELAY);
@@ -589,6 +612,37 @@ static void channel_hop_task(void *pvParameters)
 }
 
 /* ================================================================
+   Sync watchdog task
+   Sends MSG_SYNC_REQUEST to the coordinator at boot (so the
+   coordinator starts a broadcast immediately rather than waiting
+   for its next scheduled cycle), then re-requests every 15 s
+   whenever sync is absent or stale (> 45 s since last epoch).
+   ================================================================ */
+
+static void sync_watchdog_task(void *pvParameters)
+{
+    sync_request_t req = { .msg_type = MSG_SYNC_REQUEST };
+
+    /* Short delay to let ESP-NOW finish initialising before the first TX. */
+    vTaskDelay(pdMS_TO_TICKS(800));
+    printf("[sync_wd] Boot: requesting sync from coordinator\n");
+    esp_now_send(COORDINATOR_MAC, (const uint8_t *)&req, sizeof(sync_request_t));
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(15000));   /* check every 15 s */
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        bool stale = !s_epoch_valid || ((now_ms - s_last_sync_ms) > 45000);
+        if (stale) {
+            printf("[sync_wd] Sync %s — requesting from coordinator\n",
+                   s_epoch_valid ? "stale" : "missing");
+            esp_now_send(COORDINATOR_MAC,
+                         (const uint8_t *)&req, sizeof(sync_request_t));
+        }
+    }
+}
+
+/* ================================================================
    app_main
    ================================================================ */
 
@@ -661,6 +715,7 @@ void app_main(void)
     xTaskCreate(sync_handler_task,     "sync_handler",2048, NULL, 6, NULL);
     xTaskCreate(device_reporter_task,  "reporter",    4096, NULL, 3, NULL);
     xTaskCreate(channel_hop_task,      "ch_hop",      2048, NULL, 4, NULL);
+    xTaskCreate(sync_watchdog_task,    "sync_wd",     2048, NULL, 5, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
