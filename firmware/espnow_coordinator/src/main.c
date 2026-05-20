@@ -860,8 +860,18 @@ static const char DASHBOARD_HTML[] =
 "const r=dt.insertRow();"
 "r.innerHTML='<td colspan=5 style=\"color:#666\">No devices positioned yet</td>';}"
 "const nt=document.getElementById('nodecfg');"
+"const ns=d.nodes||[];"
+"if(nt.rows.length-1===ns.length&&ns.length>0){"
+/* Rows already exist — only refresh the sync status cell (col 4).
+   Leave the X/Y inputs untouched so the user can type freely. */
+"ns.forEach((n,i)=>{"
+"const row=nt.rows[i+1];if(!row)return;"
+"row.cells[4].innerHTML=n.sync?'&#x2705; OK':'&#x23F3; wait';"
+"row.cells[4].style.color=n.sync?'#6bcb77':'#ff6b6b';});"
+"}else{"
+/* Node count changed (first load or new node appeared) — full rebuild. */
 "while(nt.rows.length>1)nt.deleteRow(1);"
-"(d.nodes||[]).forEach((n,i)=>{"
+"ns.forEach((n,i)=>{"
 "const r=nt.insertRow();"
 "r.innerHTML='<td>'+(i+1)+'</td>'"
 "+'<td style=\"font-size:11px\">'+n.mac+'</td>'"
