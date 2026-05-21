@@ -8,7 +8,7 @@ Left panel : live scatter plot of trilaterated device positions.
 Right panel: embedded serial terminal showing raw coordinator output.
 
 Serial protocol (to coordinator):
-  SET_NODE <1-3> <x_m> <y_m>\\n   →   ACK SET_NODE <idx> <x> <y>
+  SET_NODE <1-3> [<MAC>] <x_m> <y_m>\\n   ->   ACK SET_NODE <idx> [<MAC>] <x> <y>
 
 Usage:
   python plot_positions.py                        # uses default port
@@ -25,7 +25,7 @@ from collections import deque
 import serial
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, TextBox
 import matplotlib.patches as mpatches
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -36,6 +36,7 @@ UPDATE_MS      = 500          # faster refresh for drag responsiveness
 TERMINAL_LINES = 36
 TERMINAL_COLS  = 62
 DRAG_FRAC      = 0.07         # pick radius as fraction of visible axis range
+MAC_RE         = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
 
@@ -43,16 +44,16 @@ PORT = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
 _lock       = threading.Lock()
 _write_lock = threading.Lock()
 
-_nodes   = {}   # {idx_str: {"mac": str, "x": float, "y": float}}   ← firmware positions
+_nodes   = {}   # {idx_str: {"mac": str, "x": float, "y": float}}   <- firmware positions
 _devices = {}   # {mac_str: {"ssid", "x", "y", "random", "ts"}}
 _serial_lines = deque(maxlen=TERMINAL_LINES)
 
 # Node override state: {idx_str: {"x": float, "y": float,
 #                                  "state": "default"|"pending"|"fixed"}}
-# "default"  — using firmware position, nothing dragged yet
-# "pending"  — dragged but SET_NODE not yet sent
-# "fixed"    — SET_NODE sent AND coordinator ACK received
 _node_overrides = {}
+
+# MAC entries typed by the user in the TextBox widgets {idx_str: mac_str}
+_mac_entries = {}
 
 _ser_conn = None   # current serial.Serial instance (written by reader thread)
 
@@ -132,13 +133,20 @@ def _serial_reader():
                             del _devices[m]
 
                 elif line.startswith("ACK SET_NODE"):
-                    # "ACK SET_NODE <idx> <x> <y>"
+                    # "ACK SET_NODE <idx> <MAC> <x> <y>"  (new)
+                    # "ACK SET_NODE <idx> <x> <y>"         (old/compat)
                     parts = line.split()
-                    if len(parts) == 5:
+                    if len(parts) >= 4:
                         idx = parts[2]
-                        with _lock:
-                            if idx in _node_overrides:
-                                _node_overrides[idx]["state"] = "fixed"
+                        # 6-part = new format with MAC
+                        if len(parts) == 6 and ":" in parts[3]:
+                            with _lock:
+                                if idx in _node_overrides:
+                                    _node_overrides[idx]["state"] = "fixed"
+                        elif len(parts) == 5:
+                            with _lock:
+                                if idx in _node_overrides:
+                                    _node_overrides[idx]["state"] = "fixed"
 
         except serial.SerialException as e:
             with _write_lock:
@@ -164,7 +172,7 @@ _COL_TERM_HI      = "#39ff14"   # bright green
 _COL_TERM_LO      = "#1a6b08"   # dim green
 
 # ── Figure layout ──────────────────────────────────────────────────────────────
-fig = plt.figure(figsize=(17, 9))
+fig = plt.figure(figsize=(17, 10))
 fig.patch.set_facecolor(_BG_OUTER)
 try:
     fig.canvas.manager.set_window_title("IPS Visualizer")
@@ -173,14 +181,50 @@ except Exception:
 
 gs = fig.add_gridspec(
     1, 2, width_ratios=[3, 2],
-    left=0.05, right=0.97, top=0.93, bottom=0.14, wspace=0.04
+    left=0.05, right=0.97, top=0.93, bottom=0.25, wspace=0.04
 )
 ax_plot = fig.add_subplot(gs[0])
 ax_term = fig.add_subplot(gs[1])
 
-# Buttons — placed below the left panel
-_BTN_Y   = 0.03
-_BTN_H   = 0.07
+# MAC address entry row (above buttons)
+_MAC_Y, _MAC_H = 0.14, 0.07
+_mac_axes = [
+    fig.add_axes([0.05,  _MAC_Y, 0.165, _MAC_H]),
+    fig.add_axes([0.225, _MAC_Y, 0.165, _MAC_H]),
+    fig.add_axes([0.40,  _MAC_Y, 0.165, _MAC_H]),
+]
+_mac_boxes = []
+for _i, _ax in enumerate(_mac_axes):
+    _tb = TextBox(_ax, f" Node {_i+1} MAC: ",
+                  initial="XX:XX:XX:XX:XX:XX",
+                  color="#060616", hovercolor="#0d0d2a")
+    _tb.label.set_color(_COL_TEXT)
+    _tb.label.set_fontsize(8)
+    try:
+        _tb.text_disp.set_color(_COL_NODE_DEFAULT)
+        _tb.text_disp.set_fontfamily("monospace")
+    except Exception:
+        pass
+    _mac_boxes.append(_tb)
+
+def _make_mac_cb(idx_str, tb):
+    def _cb(text):
+        text = text.strip().upper()
+        if MAC_RE.match(text):
+            _mac_entries[idx_str] = text
+            with _lock:
+                _serial_lines.append(f"Node {idx_str} MAC stored: {text}")
+        else:
+            with _lock:
+                _serial_lines.append(f"Invalid MAC '{text}' (need AA:BB:CC:DD:EE:FF)")
+            tb.set_val("XX:XX:XX:XX:XX:XX")
+    return _cb
+
+for _i, _tb in enumerate(_mac_boxes):
+    _tb.on_submit(_make_mac_cb(str(_i + 1), _tb))
+
+# Buttons row (below MAC row)
+_BTN_Y, _BTN_H = 0.04, 0.07
 ax_b_send  = fig.add_axes([0.05, _BTN_Y, 0.24, _BTN_H])
 ax_b_reset = fig.add_axes([0.31, _BTN_Y, 0.20, _BTN_H])
 
@@ -196,27 +240,52 @@ for btn, col in ((btn_send, _COL_NODE_FIXED), (btn_reset, _COL_RAND)):
 
 def _on_send(_event):
     with _lock:
-        pending = {k: dict(v) for k, v in _node_overrides.items()
-                   if v["state"] == "pending"}
-    if not pending:
+        overrides = dict(_node_overrides)
+        nodes     = dict(_nodes)
+
+    # Send any node that has a pending position OR a typed MAC
+    candidates = (
+        {idx for idx, ov in overrides.items() if ov.get("state") == "pending"}
+        | {idx for idx, mac in _mac_entries.items() if mac}
+    )
+    if not candidates:
         with _lock:
-            _serial_lines.append("── no pending positions to send ──")
+            _serial_lines.append("-- no pending positions or MACs to send --")
         return
-    for idx in sorted(pending, key=int):
-        ov  = pending[idx]
-        cmd = f"SET_NODE {idx} {ov['x']:.3f} {ov['y']:.3f}\n"
+
+    for idx in sorted(candidates, key=int):
+        ov  = overrides.get(idx, {})
+        x   = ov.get("x")
+        y   = ov.get("y")
+        if x is None:                        # no drag override — use firmware pos
+            n = nodes.get(idx, {})
+            x, y = n.get("x"), n.get("y")
+        if x is None:
+            with _lock:
+                _serial_lines.append(f"Node {idx}: position unknown, skip")
+            continue
+
+        mac = _mac_entries.get(idx, "")
+        if mac:
+            cmd = f"SET_NODE {idx} {mac} {x:.3f} {y:.3f}\n"
+        else:
+            cmd = f"SET_NODE {idx} {x:.3f} {y:.3f}\n"
+
         if _send_serial(cmd):
             with _lock:
-                _serial_lines.append(f"→ {cmd.strip()}")
+                _serial_lines.append(f"-> {cmd.strip()}")
         else:
             with _lock:
-                _serial_lines.append(f"✗ send failed (no connection)")
+                _serial_lines.append("send failed (no connection)")
 
 def _on_reset(_event):
     with _lock:
         _node_overrides.clear()
+    _mac_entries.clear()
+    for tb in _mac_boxes:
+        tb.set_val("XX:XX:XX:XX:XX:XX")
     with _lock:
-        _serial_lines.append("── node positions reset to firmware values ──")
+        _serial_lines.append("-- node positions and MACs reset --")
 
 btn_send.on_clicked(_on_send)
 btn_reset.on_clicked(_on_reset)

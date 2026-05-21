@@ -775,18 +775,47 @@ static void serial_cmd_task(void *pvParameters)
 
             int   node_idx;
             float x, y;
-            if (sscanf(line, "SET_NODE %d %f %f", &node_idx, &x, &y) == 3) {
-                if (node_idx >= 1 && node_idx <= NUM_NODES_EXPECTED) {
-                    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
-                    NODE_POSITIONS[node_idx - 1].x_m = x;
-                    NODE_POSITIONS[node_idx - 1].y_m = y;
-                    xSemaphoreGive(s_table_mutex);
-                    printf("ACK SET_NODE %d %.3f %.3f\n", node_idx, x, y);
-                    ESP_LOGI(TAG, "Node %d position → (%.2f, %.2f)", node_idx, x, y);
-                } else {
-                    printf("ERR SET_NODE idx %d out of range (1-%d)\n",
-                           node_idx, NUM_NODES_EXPECTED);
+            char  mac_str[20] = {0};
+
+            /* Try new format: SET_NODE <idx> <MAC> <x> <y> */
+            bool mac_provided = false;
+            if (sscanf(line, "SET_NODE %d %19s %f %f",
+                       &node_idx, mac_str, &x, &y) == 4
+                && strchr(mac_str, ':') != NULL) {
+                mac_provided = true;
+            } else if (sscanf(line, "SET_NODE %d %f %f",
+                              &node_idx, &x, &y) != 3) {
+                node_idx = 0;   /* mark as unparsed */
+            }
+
+            if (node_idx >= 1 && node_idx <= NUM_NODES_EXPECTED) {
+                xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+                NODE_POSITIONS[node_idx - 1].x_m = x;
+                NODE_POSITIONS[node_idx - 1].y_m = y;
+
+                if (mac_provided) {
+                    uint8_t mb[6];
+                    if (sscanf(mac_str,
+                               "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                               &mb[0], &mb[1], &mb[2],
+                               &mb[3], &mb[4], &mb[5]) == 6) {
+                        memcpy(NODE_POSITIONS[node_idx - 1].mac, mb, 6);
+                    }
                 }
+                xSemaphoreGive(s_table_mutex);
+
+                if (mac_provided) {
+                    printf("ACK SET_NODE %d %s %.3f %.3f\n",
+                           node_idx, mac_str, x, y);
+                    ESP_LOGI(TAG, "Node %d MAC=%s pos=(%.2f,%.2f)",
+                             node_idx, mac_str, x, y);
+                } else {
+                    printf("ACK SET_NODE %d %.3f %.3f\n", node_idx, x, y);
+                    ESP_LOGI(TAG, "Node %d pos=(%.2f,%.2f)", node_idx, x, y);
+                }
+            } else if (node_idx != 0) {
+                printf("ERR SET_NODE idx %d out of range (1-%d)\n",
+                       node_idx, NUM_NODES_EXPECTED);
             }
         } else if (pos < (int)(sizeof(line) - 1)) {
             line[pos++] = (char)c;
