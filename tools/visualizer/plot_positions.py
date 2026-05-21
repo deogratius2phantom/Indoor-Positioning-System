@@ -2,10 +2,10 @@
 """
 Indoor Positioning System — Real-time Serial Visualizer
 ========================================================
-Reads machine-readable lines from the coordinator serial output and plots
-device positions on a live floor-plan using matplotlib.
+Left panel : live scatter plot of trilaterated device positions.
+Right panel: embedded serial terminal showing raw coordinator output.
 
-Line formats (emitted by coordinator display_task):
+Line formats parsed from coordinator display_task:
   NODE|<idx>|<MAC>|<x_m>|<y_m>
   POS|<MAC>|<is_random>|<x_m>|<y_m>|<ts_ms>|<ssid>
   ---FRAME END---
@@ -19,24 +19,27 @@ Usage:
 import sys
 import time
 import threading
+from collections import deque
 import serial
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib.patches as mpatches
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DEFAULT_PORT = "/dev/cu.usbmodem101"
-BAUD_RATE    = 115200
-STALE_SECS   = 45        # remove a device dot if unseen for this long
-UPDATE_MS    = 1000      # plot refresh interval
+DEFAULT_PORT   = "/dev/cu.usbmodem101"
+BAUD_RATE      = 115200
+STALE_SECS     = 45        # remove a device dot if unseen for this long
+UPDATE_MS      = 1000      # plot refresh interval
+TERMINAL_LINES = 38        # max lines kept in the serial terminal panel
+TERMINAL_COLS  = 62        # characters per line before truncation
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
 
 # ── Shared state (written by reader thread, read by plot thread) ───────────────
-_lock   = threading.Lock()
-_nodes  = {}    # { "1": {"mac": str, "x": float, "y": float} }
-_devices = {}   # { mac_str: {"ssid": str, "x": float, "y": float,
-                #              "random": bool, "ts": float} }
+_lock         = threading.Lock()
+_nodes        = {}                          # { "1": {"mac", "x", "y"} }
+_devices      = {}                          # { mac: {"ssid","x","y","random","ts"} }
+_serial_lines = deque(maxlen=TERMINAL_LINES)  # raw terminal lines
 
 # ── Serial reader thread ───────────────────────────────────────────────────────
 def _serial_reader():
@@ -44,11 +47,17 @@ def _serial_reader():
         try:
             with serial.Serial(PORT, BAUD_RATE, timeout=1) as ser:
                 print(f"[visualizer] connected to {PORT} @ {BAUD_RATE}")
+                with _lock:
+                    _serial_lines.append(f"── connected to {PORT} ──")
                 while True:
                     raw = ser.readline()
                     if not raw:
                         continue
                     line = raw.decode("utf-8", errors="replace").strip()
+
+                    # Always append to terminal buffer
+                    with _lock:
+                        _serial_lines.append(line)
 
                     if line.startswith("NODE|"):
                         # NODE|<idx>|<MAC>|<x>|<y>
@@ -94,44 +103,57 @@ def _serial_reader():
                                 del _devices[m]
 
         except serial.SerialException as e:
-            print(f"[visualizer] serial error: {e}  — retrying in 3 s")
+            msg = f"── serial error: {e} — retry in 3s ──"
+            print(f"[visualizer] {msg}")
+            with _lock:
+                _serial_lines.append(msg)
             time.sleep(3)
 
 # ── Plot setup ─────────────────────────────────────────────────────────────────
 _BG_OUTER  = "#1a1a2e"
 _BG_INNER  = "#16213e"
+_BG_TERM   = "#0d0d14"
 _COL_NODE  = "#00d4ff"   # sniffer anchor triangles
 _COL_KNOWN = "#ffd93d"   # device with stable MAC
 _COL_RAND  = "#ff6b6b"   # device with randomized MAC
 _COL_TEXT  = "#e0e0e0"
 _COL_GRID  = "#2a2a4a"
+_COL_TERM  = "#39ff14"   # terminal text (neon green)
+_COL_TERM_DIM = "#1a6b08"  # dimmer colour for older lines
 
-fig, ax = plt.subplots(figsize=(9, 8))
+fig = plt.figure(figsize=(17, 8))
 fig.patch.set_facecolor(_BG_OUTER)
 fig.canvas.manager.set_window_title("IPS Visualizer")
 
+gs = fig.add_gridspec(1, 2, width_ratios=[3, 2], wspace=0.04,
+                      left=0.05, right=0.97, top=0.93, bottom=0.06)
+ax_plot = fig.add_subplot(gs[0])
+ax_term = fig.add_subplot(gs[1])
+
 def _update(_frame):
-    ax.clear()
-    ax.set_facecolor(_BG_INNER)
-    ax.set_title("Indoor Positioning System — Live", color=_COL_TEXT,
-                 fontsize=13, fontweight="bold", pad=12)
-    ax.set_xlabel("X (m)", color=_COL_TEXT)
-    ax.set_ylabel("Y (m)", color=_COL_TEXT)
-    ax.tick_params(colors=_COL_TEXT, labelsize=9)
-    for spine in ax.spines.values():
+    # ── LEFT: position scatter plot ───────────────────────────────────────────
+    ax_plot.clear()
+    ax_plot.set_facecolor(_BG_INNER)
+    ax_plot.set_title("Indoor Positioning System — Live", color=_COL_TEXT,
+                      fontsize=12, fontweight="bold", pad=10)
+    ax_plot.set_xlabel("X (m)", color=_COL_TEXT)
+    ax_plot.set_ylabel("Y (m)", color=_COL_TEXT)
+    ax_plot.tick_params(colors=_COL_TEXT, labelsize=9)
+    for spine in ax_plot.spines.values():
         spine.set_edgecolor("#444466")
-    ax.grid(True, color=_COL_GRID, linestyle="--", linewidth=0.6, zorder=0)
+    ax_plot.grid(True, color=_COL_GRID, linestyle="--", linewidth=0.6, zorder=0)
 
     with _lock:
         nodes_snap   = dict(_nodes)
         devices_snap = dict(_devices)
+        term_snap    = list(_serial_lines)
 
-    # ── Draw sniffer node anchors ──────────────────────────────────────────────
+    # Draw sniffer node anchors
     for idx, node in nodes_snap.items():
-        ax.plot(node["x"], node["y"], "^",
-                color=_COL_NODE, markersize=16, zorder=5,
-                markeredgecolor="#003344", markeredgewidth=1.2)
-        ax.annotate(
+        ax_plot.plot(node["x"], node["y"], "^",
+                     color=_COL_NODE, markersize=16, zorder=5,
+                     markeredgecolor="#003344", markeredgewidth=1.2)
+        ax_plot.annotate(
             f"Node {idx}\n{node['mac'][-8:]}",
             (node["x"], node["y"]),
             textcoords="offset points", xytext=(10, 8),
@@ -140,54 +162,72 @@ def _update(_frame):
                       edgecolor=_COL_NODE, alpha=0.7),
         )
 
-    # ── Draw positioned devices ────────────────────────────────────────────────
+    # Draw positioned devices
     for mac, dev in devices_snap.items():
         age   = time.time() - dev["ts"]
         alpha = max(0.3, 1.0 - age / STALE_SECS)
         color = _COL_RAND if dev["random"] else _COL_KNOWN
 
-        ax.plot(dev["x"], dev["y"], "o",
-                color=color, markersize=11, alpha=alpha, zorder=4,
-                markeredgecolor=_BG_INNER, markeredgewidth=1.0)
+        ax_plot.plot(dev["x"], dev["y"], "o",
+                     color=color, markersize=11, alpha=alpha, zorder=4,
+                     markeredgecolor=_BG_INNER, markeredgewidth=1.0)
 
         short_ssid = (dev["ssid"][:14] + "…") if len(dev["ssid"]) > 14 else dev["ssid"]
-        label = f"{short_ssid}\n{mac[-8:]}"
-        ax.annotate(
-            label,
+        ax_plot.annotate(
+            f"{short_ssid}\n{mac[-8:]}",
             (dev["x"], dev["y"]),
             textcoords="offset points", xytext=(7, 6),
             color=color, fontsize=7, alpha=alpha,
         )
 
-    # ── Draw distance circles from each node to each device (optional) ────────
-    # Uncomment if you want range rings:
-    # for mac, dev in devices_snap.items():
-    #     for idx, node in nodes_snap.items():
-    #         d = ((dev["x"]-node["x"])**2 + (dev["y"]-node["y"])**2)**0.5
-    #         circle = plt.Circle((node["x"], node["y"]), d,
-    #                             fill=False, color="#333355", linewidth=0.5, zorder=1)
-    #         ax.add_patch(circle)
-
-    # ── Legend ─────────────────────────────────────────────────────────────────
     legend_handles = [
         mpatches.Patch(color=_COL_NODE,  label="Sniffer node anchor"),
         mpatches.Patch(color=_COL_KNOWN, label="Device (stable MAC)"),
         mpatches.Patch(color=_COL_RAND,  label="Device (random MAC)"),
     ]
-    leg = ax.legend(handles=legend_handles, loc="upper right",
-                    facecolor=_BG_OUTER, edgecolor="#444466",
-                    labelcolor=_COL_TEXT, fontsize=9)
+    ax_plot.legend(handles=legend_handles, loc="upper right",
+                   facecolor=_BG_OUTER, edgecolor="#444466",
+                   labelcolor=_COL_TEXT, fontsize=9)
 
-    # Status line
     n_dev = len(devices_snap)
-    status = (f"{n_dev} device{'s' if n_dev != 1 else ''} positioned  |  "
+    fig.texts.clear()
+    fig.text(0.5, 0.01,
+             (f"{n_dev} device{'s' if n_dev != 1 else ''} positioned  |  "
               f"{len(nodes_snap)} node{'s' if len(nodes_snap) != 1 else ''} configured  |  "
-              f"stale timeout {STALE_SECS}s")
-    fig.text(0.5, 0.01, status, ha="center", va="bottom",
-             color="#666688", fontsize=8)
+              f"stale timeout {STALE_SECS}s"),
+             ha="center", va="bottom", color="#666688", fontsize=8)
 
-    ax.set_aspect("equal", adjustable="datalim")
-    ax.margins(0.25)
+    ax_plot.set_aspect("equal", adjustable="datalim")
+    ax_plot.margins(0.25)
+
+    # ── RIGHT: serial terminal ────────────────────────────────────────────────
+    ax_term.clear()
+    ax_term.set_facecolor(_BG_TERM)
+    ax_term.set_xticks([])
+    ax_term.set_yticks([])
+    for spine in ax_term.spines.values():
+        spine.set_edgecolor("#00ff4133")
+    ax_term.set_title("Serial Monitor", color=_COL_TERM,
+                      fontsize=10, fontweight="bold", pad=6)
+
+    # Render lines bottom-to-top so newest is at the bottom
+    total = len(term_snap)
+    line_height = 1.0 / (TERMINAL_LINES + 1)
+    for i, txt in enumerate(term_snap):
+        # Truncate and escape any chars that confuse text rendering
+        truncated = txt[:TERMINAL_COLS]
+        # Fade older lines slightly
+        age_frac  = i / max(total - 1, 1)
+        color = _COL_TERM if age_frac > 0.6 else _COL_TERM_DIM
+        y_pos = (i + 0.5) * line_height
+        ax_term.text(
+            0.01, y_pos, truncated,
+            transform=ax_term.transAxes,
+            va="center", ha="left",
+            fontfamily="monospace", fontsize=7,
+            color=color,
+        )
+
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -195,5 +235,4 @@ if __name__ == "__main__":
     reader.start()
 
     ani = FuncAnimation(fig, _update, interval=UPDATE_MS, cache_frame_data=False)
-    plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.show()
