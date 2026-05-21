@@ -708,6 +708,35 @@ static void display_task(void *pvParameters)
         printf("\n"
                "════════════════════════════════════════════════════════════════════\n\n");
 
+        /* ---- Machine-readable lines consumed by the Python visualizer ----
+         * Format:
+         *   NODE|<idx>|<MAC>|<x_m>|<y_m>
+         *   POS|<MAC>|<is_random>|<x_m>|<y_m>|<ts_ms>|<ssid>
+         *   ---FRAME END---
+         * Python splits on '|' with maxsplit=6 so SSIDs may contain '|'.  */
+        for (int n = 0; n < NUM_NODES_EXPECTED; n++) {
+            printf("NODE|%d|%02X:%02X:%02X:%02X:%02X:%02X|%.2f|%.2f\n",
+                   n + 1,
+                   NODE_POSITIONS[n].mac[0], NODE_POSITIONS[n].mac[1],
+                   NODE_POSITIONS[n].mac[2], NODE_POSITIONS[n].mac[3],
+                   NODE_POSITIONS[n].mac[4], NODE_POSITIONS[n].mac[5],
+                   NODE_POSITIONS[n].x_m, NODE_POSITIONS[n].y_m);
+        }
+        for (int t = 0; t < s_trilat_count; t++) {
+            trilat_device_t *te = &s_trilat_devices[t];
+            if (te->position_valid) {
+                printf("POS|%02X:%02X:%02X:%02X:%02X:%02X|%d|%.2f|%.2f|%lu|%s\n",
+                       te->target_mac[0], te->target_mac[1],
+                       te->target_mac[2], te->target_mac[3],
+                       te->target_mac[4], te->target_mac[5],
+                       te->is_random ? 1 : 0,
+                       te->est_x_m, te->est_y_m,
+                       (unsigned long)now_ms,
+                       te->ssid[0] ? te->ssid : "<hidden>");
+            }
+        }
+        printf("---FRAME END---\n");
+
         xSemaphoreGive(s_table_mutex);
     }
 }
