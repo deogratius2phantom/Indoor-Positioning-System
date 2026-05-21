@@ -627,6 +627,12 @@ static void display_task(void *pvParameters)
             }
         }
 
+        /* Release mutex before printing — printf blocks for ~600 ms at
+           115200 baud with 80+ lines; holding the mutex that long starves
+           handler_data and exhausts the httpd socket pool.
+           printf calls below are read-only; slightly stale output is fine. */
+        xSemaphoreGive(s_table_mutex);
+
         printf("\n"
                "╔══════════════════════════════════════════════════════════════════╗\n"
                "║  ESP-NOW Coordinator  [%8lu ms]  %d node(s)  epoch=%lu\n"
@@ -721,8 +727,6 @@ static void display_task(void *pvParameters)
 
         printf("\n"
                "════════════════════════════════════════════════════════════════════\n\n");
-
-        xSemaphoreGive(s_table_mutex);
     }
 }
 
@@ -933,7 +937,15 @@ static esp_err_t handler_data(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(s_table_mutex, pdMS_TO_TICKS(300)) != pdTRUE) {
+        /* Mutex busy — return empty-but-valid JSON; browser retries in 3s */
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_set_hdr(req, "Connection", "close");
+        httpd_resp_send(req, "{\"nodes\":[],\"devices\":[]}", HTTPD_RESP_USE_STRLEN);
+        cJSON_Delete(root);
+        return ESP_OK;
+    }
 
     /* Room bounding box derived from configured positions (+ 10 % margin) */
     float room_w = 1.0f, room_h = 1.0f;
@@ -1001,11 +1013,13 @@ static esp_err_t handler_data(httpd_req_t *req)
            browser doesn't crash; it will retry on the next 2-second poll. */
         httpd_resp_set_type(req, "application/json");
         httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_set_hdr(req, "Connection", "close");
         httpd_resp_send(req, "{\"nodes\":[],\"devices\":[]}", HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Connection", "close");
     httpd_resp_send(req, js, HTTPD_RESP_USE_STRLEN);
     free(js);
     return ESP_OK;
