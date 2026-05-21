@@ -55,6 +55,10 @@ _node_overrides = {}
 # MAC entries typed by the user in the TextBox widgets {idx_str: mac_str}
 _mac_entries = {}
 
+# MACs of sniffer nodes auto-discovered via DISC| serial lines (ordered)
+_discovered_macs = []
+_cycle_idx = {"1": 0, "2": 0, "3": 0}   # per-node cycle pointer
+
 _ser_conn = None   # current serial.Serial instance (written by reader thread)
 
 # ── Drag state (main-thread only) ─────────────────────────────────────────────
@@ -148,6 +152,28 @@ def _serial_reader():
                                 if idx in _node_overrides:
                                     _node_overrides[idx]["state"] = "fixed"
 
+                elif line.startswith("DISC|"):
+                    # "DISC|AA:BB:CC:DD:EE:FF" — coordinator discovered a sniffer node
+                    parts = line.split("|")
+                    if len(parts) == 2 and MAC_RE.match(parts[1]):
+                        mac = parts[1].upper()
+                        if mac not in _discovered_macs:
+                            _discovered_macs.append(mac)
+                            slot = len(_discovered_macs)   # 1, 2, or 3
+                            # auto-fill the corresponding TextBox if user hasn't typed
+                            if slot <= 3 and _mac_boxes:
+                                tb = _mac_boxes[slot - 1]
+                                idx_str = str(slot)
+                                # only auto-fill if TextBox still shows placeholder
+                                cur = tb.text if hasattr(tb, "text") else ""
+                                if cur in ("", "XX:XX:XX:XX:XX:XX"):
+                                    tb.set_val(mac)
+                                    _mac_entries[idx_str] = mac
+                                    with _lock:
+                                        _serial_lines.append(
+                                            f"Auto-filled Node {slot} MAC: {mac}"
+                                        )
+
         except serial.SerialException as e:
             with _write_lock:
                 _ser_conn = None
@@ -187,15 +213,22 @@ ax_plot = fig.add_subplot(gs[0])
 ax_term = fig.add_subplot(gs[1])
 
 # MAC address entry row (above buttons)
+# Layout: [TextBox  ⟳] [TextBox  ⟳] [TextBox  ⟳]
 _MAC_Y, _MAC_H = 0.14, 0.07
+_TB_W, _CYC_W, _GAP = 0.13, 0.034, 0.002
 _mac_axes = [
-    fig.add_axes([0.05,  _MAC_Y, 0.165, _MAC_H]),
-    fig.add_axes([0.225, _MAC_Y, 0.165, _MAC_H]),
-    fig.add_axes([0.40,  _MAC_Y, 0.165, _MAC_H]),
+    fig.add_axes([0.05,                              _MAC_Y, _TB_W,  _MAC_H]),
+    fig.add_axes([0.05 + _TB_W + _CYC_W + 0.015,    _MAC_Y, _TB_W,  _MAC_H]),
+    fig.add_axes([0.05 + 2*(_TB_W + _CYC_W + 0.015), _MAC_Y, _TB_W, _MAC_H]),
+]
+_cyc_axes = [
+    fig.add_axes([0.05 + _TB_W + _GAP,               _MAC_Y, _CYC_W, _MAC_H]),
+    fig.add_axes([0.05 + _TB_W + _CYC_W + 0.015 + _TB_W + _GAP, _MAC_Y, _CYC_W, _MAC_H]),
+    fig.add_axes([0.05 + 2*(_TB_W + _CYC_W + 0.015) + _TB_W + _GAP, _MAC_Y, _CYC_W, _MAC_H]),
 ]
 _mac_boxes = []
 for _i, _ax in enumerate(_mac_axes):
-    _tb = TextBox(_ax, f" Node {_i+1} MAC: ",
+    _tb = TextBox(_ax, f" N{_i+1} MAC: ",
                   initial="XX:XX:XX:XX:XX:XX",
                   color="#060616", hovercolor="#0d0d2a")
     _tb.label.set_color(_COL_TEXT)
@@ -222,6 +255,29 @@ def _make_mac_cb(idx_str, tb):
 
 for _i, _tb in enumerate(_mac_boxes):
     _tb.on_submit(_make_mac_cb(str(_i + 1), _tb))
+
+def _make_cycle_cb(idx_str, tb):
+    """Cycle through _discovered_macs for the given node slot."""
+    def _cb(_event):
+        if not _discovered_macs:
+            with _lock:
+                _serial_lines.append("No nodes discovered yet — power on sniffer nodes")
+            return
+        _cycle_idx[idx_str] = (_cycle_idx[idx_str] + 1) % len(_discovered_macs)
+        mac = _discovered_macs[_cycle_idx[idx_str]]
+        tb.set_val(mac)
+        _mac_entries[idx_str] = mac
+        with _lock:
+            _serial_lines.append(f"Node {idx_str} -> {mac}")
+    return _cb
+
+_mac_cycle_btns = []
+for _i, _cax in enumerate(_cyc_axes):
+    _cb_btn = Button(_cax, "\u27f3", color="#0a0a2a", hovercolor="#1a1a4a")
+    _cb_btn.label.set_color(_COL_NODE_DEFAULT)
+    _cb_btn.label.set_fontsize(11)
+    _cb_btn.on_clicked(_make_cycle_cb(str(_i + 1), _mac_boxes[_i]))
+    _mac_cycle_btns.append(_cb_btn)
 
 # Buttons row (below MAC row)
 _BTN_Y, _BTN_H = 0.04, 0.07
@@ -282,6 +338,7 @@ def _on_reset(_event):
     with _lock:
         _node_overrides.clear()
     _mac_entries.clear()
+    _cycle_idx.update({"1": 0, "2": 0, "3": 0})
     for tb in _mac_boxes:
         tb.set_val("XX:XX:XX:XX:XX:XX")
     with _lock:

@@ -212,7 +212,38 @@ static QueueHandle_t     s_ack_queue;
 static volatile uint32_t s_epoch_id = 0;
 static TaskHandle_t      s_sync_task_handle = NULL;   /* for on-demand wake-up */
 
+/* MACs of sniffer nodes discovered via ESP-NOW (sync ack or RSSI report).
+   Protected by s_table_mutex.  Emitted as DISC| lines for the visualizer. */
+static uint8_t           s_disc_macs[MAX_NODES][6];
+static int               s_num_disc = 0;
+
 static const uint8_t BROADCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+/* ================================================================
+   Helper: record a newly-seen sniffer MAC and emit DISC| serial line.
+   Safe to call from any task context (takes its own mutex slice).
+   ================================================================ */
+
+static void register_disc_mac(const uint8_t *mac)
+{
+    bool is_new = false;
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    bool found = false;
+    for (int i = 0; i < s_num_disc; i++) {
+        if (memcmp(s_disc_macs[i], mac, 6) == 0) { found = true; break; }
+    }
+    if (!found && s_num_disc < MAX_NODES) {
+        memcpy(s_disc_macs[s_num_disc++], mac, 6);
+        is_new = true;
+    }
+    xSemaphoreGive(s_table_mutex);
+    if (is_new) {
+        printf("DISC|%02X:%02X:%02X:%02X:%02X:%02X\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        ESP_LOGI(TAG, "Discovered sniffer: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+}
 
 /* ================================================================
    Helper: find or register a node in the node table
@@ -370,6 +401,7 @@ static void aggregator_task(void *pvParameters)
             strncpy(dev->ssid, report.ssid, 32);
 
         xSemaphoreGive(s_table_mutex);
+        register_disc_mac(report.sender_mac);
     }
 }
 
@@ -406,6 +438,7 @@ static void sync_processor_task(void *pvParameters)
                      (long)offset_ms, (long)rtt_ms);
         }
         xSemaphoreGive(s_table_mutex);
+        register_disc_mac(env.src_mac);
     }
 }
 
@@ -712,8 +745,14 @@ static void display_task(void *pvParameters)
          * Format:
          *   NODE|<idx>|<MAC>|<x_m>|<y_m>
          *   POS|<MAC>|<is_random>|<x_m>|<y_m>|<ts_ms>|<ssid>
+         *   DISC|<MAC>            — discovered sniffer node MAC (re-emitted every cycle)
          *   ---FRAME END---
          * Python splits on '|' with maxsplit=6 so SSIDs may contain '|'.  */
+        for (int d = 0; d < s_num_disc; d++) {
+            printf("DISC|%02X:%02X:%02X:%02X:%02X:%02X\n",
+                   s_disc_macs[d][0], s_disc_macs[d][1], s_disc_macs[d][2],
+                   s_disc_macs[d][3], s_disc_macs[d][4], s_disc_macs[d][5]);
+        }
         for (int n = 0; n < NUM_NODES_EXPECTED; n++) {
             printf("NODE|%d|%02X:%02X:%02X:%02X:%02X:%02X|%.2f|%.2f\n",
                    n + 1,
