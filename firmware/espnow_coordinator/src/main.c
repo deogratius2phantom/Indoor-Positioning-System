@@ -83,7 +83,7 @@ typedef struct {
     float   y_m;
 } node_position_t;
 
-static const node_position_t NODE_POSITIONS[NUM_NODES_EXPECTED] = {
+static node_position_t NODE_POSITIONS[NUM_NODES_EXPECTED] = {
     /* { MAC bytes },                   X (m)   Y (m) */
     { {0x00,0x00,0x00,0x00,0x00,0x01},  0.0f,   0.0f  }, /* Node 1 — origin     */
     { {0x00,0x00,0x00,0x00,0x00,0x02},  5.0f,   0.0f  }, /* Node 2 — X-axis     */
@@ -742,6 +742,59 @@ static void display_task(void *pvParameters)
 }
 
 /* ================================================================
+   Serial command task — processes config commands sent by the Python
+   visualizer (or any serial terminal) over the USB console.
+
+   Protocol (one command per line, \n terminated):
+     SET_NODE <1-3> <x_m> <y_m>    — update a node anchor position
+   Responses:
+     ACK SET_NODE <idx> <x> <y>    — accepted
+     ERR SET_NODE <reason>         — rejected
+   ================================================================ */
+
+static void serial_cmd_task(void *pvParameters)
+{
+    char line[80];
+    int  pos = 0;
+    int  c;
+
+    setvbuf(stdin, NULL, _IONBF, 0);  /* byte-by-byte; no line-buffer waiting */
+
+    for (;;) {
+        c = getchar();
+        if (c < 0) {                  /* EOF / no USB host attached            */
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (c == '\r') continue;      /* strip CR from CR+LF pairs             */
+
+        if (c == '\n') {
+            if (pos == 0) continue;   /* skip blank lines                      */
+            line[pos] = '\0';
+            pos = 0;
+
+            int   node_idx;
+            float x, y;
+            if (sscanf(line, "SET_NODE %d %f %f", &node_idx, &x, &y) == 3) {
+                if (node_idx >= 1 && node_idx <= NUM_NODES_EXPECTED) {
+                    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+                    NODE_POSITIONS[node_idx - 1].x_m = x;
+                    NODE_POSITIONS[node_idx - 1].y_m = y;
+                    xSemaphoreGive(s_table_mutex);
+                    printf("ACK SET_NODE %d %.3f %.3f\n", node_idx, x, y);
+                    ESP_LOGI(TAG, "Node %d position → (%.2f, %.2f)", node_idx, x, y);
+                } else {
+                    printf("ERR SET_NODE idx %d out of range (1-%d)\n",
+                           node_idx, NUM_NODES_EXPECTED);
+                }
+            }
+        } else if (pos < (int)(sizeof(line) - 1)) {
+            line[pos++] = (char)c;
+        }
+    }
+}
+
+/* ================================================================
    app_main
    ================================================================ */
 
@@ -797,6 +850,7 @@ void app_main(void)
     xTaskCreate(sync_task,           "sync",       2048, NULL, 4, NULL);
     xTaskCreate(trilateration_task,  "trilat",     4096, NULL, 3, NULL);
     xTaskCreate(display_task,        "display",    4096, NULL, 2, NULL);
+    xTaskCreate(serial_cmd_task,     "serial_cmd", 3072, NULL, 2, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
