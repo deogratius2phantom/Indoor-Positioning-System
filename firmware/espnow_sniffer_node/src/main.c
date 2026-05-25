@@ -463,27 +463,33 @@ static void sync_handler_task(void *pvParameters)
         xQueueSend(s_led_queue, &led_blue,  0);
         xQueueSend(s_led_queue, &led_flash, 0);
 
+        /* Capture T3 NOW — before channel-switch overhead — so the coordinator's
+           RTT formula: rtt = (T4-T1)-(T3-T2) does not absorb the 5 ms settle
+           delay as fake "node processing time", which would bias offset by ~2 ms. */
+        uint32_t T3 = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
         /* Switch to reporting channel and send ACK */
         s_hopper_pause = true;
         esp_wifi_set_channel(REPORT_CHANNEL, WIFI_SECOND_CHAN_NONE);
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(5));   /* let channel settle before TX */
 
         sync_ack_t ack = {
             .msg_type    = MSG_SYNC_ACK,
             .epoch_id    = env.epoch.epoch_id,
             .coord_T1_ms = env.epoch.coord_T1_ms,
             .node_T2_ms  = T2,
-            .node_T3_ms  = (uint32_t)(esp_timer_get_time() / 1000ULL),
+            .node_T3_ms  = T3,
         };
         esp_now_send(COORDINATOR_MAC, (const uint8_t *)&ack, sizeof(sync_ack_t));
         /* espnow_send_cb will fire here and flash white for the ACK TX */
 
         s_hopper_pause = false;
 
-        printf("[sync] Epoch %lu  T1(coord)=%lu ms  T2(local)=%lu ms  ACK sent\n",
+        printf("[sync] Epoch %lu  T1(coord)=%lu ms  T2(local)=%lu ms  T3=%lu ms  ACK sent\n",
                (unsigned long)env.epoch.epoch_id,
                (unsigned long)env.epoch.coord_T1_ms,
-               (unsigned long)T2);
+               (unsigned long)T2,
+               (unsigned long)T3);
     }
 }
 

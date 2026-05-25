@@ -1,0 +1,63 @@
+name: Build IPS Visualizer
+
+on:
+  push:
+    paths:
+      - 'tools/visualizer/plot_positions.py'
+      - 'tools/visualizer/requirements.txt'
+      - 'tools/visualizer/ips_visualizer.spec'
+      - '.github/workflows/build_visualizer.yml'
+  workflow_dispatch:   # allow manual trigger from GitHub UI
+
+jobs:
+  build-macos:
+    name: macOS .app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r tools/visualizer/requirements.txt
+          pip install pyinstaller
+
+      - name: Build .app
+        working-directory: tools/visualizer
+        run: pyinstaller ips_visualizer.spec --distpath dist --workpath build --noconfirm
+
+      - name: Zip .app bundle
+        working-directory: tools/visualizer/dist
+        run: zip -r "IPS-Visualizer-macOS.zip" "IPS Visualizer.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPS-Visualizer-macOS
+          path: tools/visualizer/dist/IPS-Visualizer-macOS.zip
+
+  build-windows:
+    name: Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r tools/visualizer/requirements.txt
+          pip install pyinstaller
+
+      - name: Build .exe
+        working-directory: tools/visualizer
+        run: pyinstaller ips_visualizer.spec --distpath dist --workpath build --noconfirm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPS-Visualizer-Windows
+          path: "tools/visualizer/dist/IPS Visualizer.exe"

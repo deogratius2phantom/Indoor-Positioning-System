@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -25,70 +24,15 @@ static const char *TAG = "coordinator";
 #define MAX_DEVICES_NODE       64      /* maximum tracked devices per node     */
 #define QUEUE_DEPTH            64      /* incoming report queue depth          */
 #define STALE_MS               60000   /* evict device entries unseen for 60 s */
-#define DISPLAY_PERIOD_MS      10000   /* print aggregated table every 10 s    */
+#define DISPLAY_PERIOD_MS      5000    /* emit RSSI table every 5 s            */
 #define SYNC_PERIOD_MS           30000  /* steady-state sync cadence            */
 #define SYNC_STARTUP_PERIOD_MS   3000   /* rapid cadence during first 60 s      */
 #define SYNC_STARTUP_DURATION_MS 60000  /* duration of the startup burst phase  */
 #define SYNC_BCAST_INTERVAL_MS   500    /* gap between repeated epoch broadcasts */
 #define SYNC_BCAST_COUNT         14
 
-/* ================================================================
-   Trilateration Configuration
-   ================================================================ */
-
-/* RSSI (dBm) measured at exactly 1 metre from a transmitter.
-   Calibrate this: place a phone 1 m from one node, check avg_rssi,
-   use that value here.  Typical indoor range: -40 to -55 dBm.      */
-#define RSSI_REF               -50
-
-/* Indoor path-loss exponent.
-   2.0 = free space;  2.7 = open office;  3.0-3.5 = walls/obstacles */
-#define PATH_LOSS_EXP          3.0f
-
-/* Cross-node device table capacity */
-#define MAX_TRILAT_DEVICES     32
-
-/* Run a trilateration pass this often */
-#define TRILAT_PERIOD_MS       5000
-
-/* Accept observations whose window_id differs by at most this much.
-   Set to 2 to handle nodes that sync on different broadcasts within
-   the same epoch (up to 7 s apart → at most 1 window difference +
-   one extra slot of margin).                                         */
-#define WINDOW_TOLERANCE       2
-
-/* Exact number of nodes for the algebraic 3-node solver */
-#define NUM_NODES_EXPECTED     3
-
-/* ================================================================
-   Node Physical Positions
-   ---------------------------------------------------------------
-   Replace the placeholder MACs with the MAC printed by each sniffer
-   node at boot ("Sniffer node MAC: XX:XX:XX:XX:XX:XX").
-   Set x_m / y_m to the node's physical position in metres,
-   measured from a common room origin (e.g. one corner of the room).
-
-   Example layout (bird's-eye view):
-
-       Node 3 (2.5, 4.0)
-           *
-
-       *               *
-   Node 1 (0, 0)   Node 2 (5, 0)   ← origin wall
-   ================================================================ */
-
-typedef struct {
-    uint8_t mac[6];
-    float   x_m;
-    float   y_m;
-} node_position_t;
-
-static node_position_t NODE_POSITIONS[NUM_NODES_EXPECTED] = {
-    /* { MAC bytes },                   X (m)   Y (m) */
-    { {0x00,0x00,0x00,0x00,0x00,0x01},  0.0f,   0.0f  }, /* Node 1 — origin     */
-    { {0x00,0x00,0x00,0x00,0x00,0x02},  5.0f,   0.0f  }, /* Node 2 — X-axis     */
-    { {0x00,0x00,0x00,0x00,0x00,0x03},  2.5f,   4.0f  }, /* Node 3 — far wall   */
-};
+/* Trilateration is now performed in the Python visualizer.
+   The coordinator only collects RSSI data and emits RSSI| serial lines. */
 
 /* ================================================================
    Message types — MUST match espnow_sniffer_node
@@ -173,39 +117,11 @@ typedef struct {
 } ack_envelope_t;
 
 /* ================================================================
-   Trilateration cross-node structures
-   ================================================================ */
-
-/* One sighting of a device from a single sniffer node */
-typedef struct {
-    uint8_t  node_mac[6];
-    int8_t   rssi;
-    float    distance_m;
-    uint32_t window_id;
-} node_observation_t;
-
-/* Aggregated entry: all node observations for one target device,
-   plus the computed (x, y) estimate once trilateration succeeds.  */
-typedef struct {
-    uint8_t            target_mac[6];
-    char               ssid[33];
-    uint8_t            is_random;
-    node_observation_t obs[MAX_NODES];
-    uint8_t            obs_count;
-    float              est_x_m;
-    float              est_y_m;
-    bool               position_valid;
-    uint32_t           last_updated_ms;
-} trilat_device_t;
-
-/* ================================================================
    Globals
    ================================================================ */
 
 static coord_node_t      s_nodes[MAX_NODES];
 static uint8_t           s_node_count = 0;
-static trilat_device_t   s_trilat_devices[MAX_TRILAT_DEVICES];
-static uint8_t           s_trilat_count = 0;
 static SemaphoreHandle_t s_table_mutex;
 static QueueHandle_t     s_report_queue;
 static QueueHandle_t     s_ack_queue;
@@ -265,48 +181,6 @@ static coord_node_t *find_or_create_node(const uint8_t *mac)
     ESP_LOGI(TAG, "New node registered: %02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return n;
-}
-
-/* ================================================================
-   Trilateration helpers
-   ================================================================ */
-
-/* Log-distance path loss: d = 10 ^ ((RSSI_ref - RSSI) / (10 * n))
-   Clamped to [0.1 m, 50 m] to prevent solver instability.           */
-static float rssi_to_distance(int8_t rssi)
-{
-    float exponent = ((float)RSSI_REF - (float)rssi) / (10.0f * PATH_LOSS_EXP);
-    float d = powf(10.0f, exponent);
-    if (d < 0.1f)  d = 0.1f;
-    if (d > 50.0f) d = 50.0f;
-    return d;
-}
-
-/* Exact algebraic trilateration for 3 nodes using Cramer's rule.
-   Subtracts circle 1 from circles 2 and 3 to yield 2 linear eqs:
-     A·x + B·y = C
-     D·x + E·y = F
-   Solve: det = A·E − B·D;  x = (C·E − B·F)/det;  y = (A·F − C·D)/det
-   Returns false when nodes are collinear (det ≈ 0).                  */
-static bool trilaterate_2d(float x1, float y1, float d1,
-                           float x2, float y2, float d2,
-                           float x3, float y3, float d3,
-                           float *out_x, float *out_y)
-{
-    float A = 2.0f * (x1 - x2);
-    float B = 2.0f * (y1 - y2);
-    float C = d2*d2 - d1*d1 - x2*x2 + x1*x1 - y2*y2 + y1*y1;
-
-    float D = 2.0f * (x1 - x3);
-    float E = 2.0f * (y1 - y3);
-    float F = d3*d3 - d1*d1 - x3*x3 + x1*x1 - y3*y3 + y1*y1;
-
-    float det = A * E - B * D;
-    if (fabsf(det) < 1e-6f) return false;
-
-    *out_x = (C * E - B * F) / det;
-    *out_y = (A * F - C * D) / det;
-    return true;
 }
 
 /* ================================================================
@@ -436,6 +310,11 @@ static void sync_processor_task(void *pvParameters)
                      env.src_mac[0], env.src_mac[1], env.src_mac[2],
                      env.src_mac[3], env.src_mac[4], env.src_mac[5],
                      (long)offset_ms, (long)rtt_ms);
+            /* Machine-readable sync status for the visualizer terminal */
+            printf("SYNC|%02X:%02X:%02X:%02X:%02X:%02X|%+ld|%ld\n",
+                   env.src_mac[0], env.src_mac[1], env.src_mac[2],
+                   env.src_mac[3], env.src_mac[4], env.src_mac[5],
+                   (long)offset_ms, (long)rtt_ms);
         }
         xSemaphoreGive(s_table_mutex);
         register_disc_mac(env.src_mac);
@@ -492,137 +371,38 @@ static void sync_task(void *pvParameters)
 }
 
 /* ================================================================
-   Trilateration task
-   Runs every TRILAT_PERIOD_MS:
-     1. Rebuilds the cross-node view from s_nodes[].
-     2. For each device seen by all NUM_NODES_EXPECTED nodes within
-        WINDOW_TOLERANCE, looks up node physical positions and calls
-        the algebraic solver.
-     3. Stores (est_x_m, est_y_m) in s_trilat_devices[] for the
-        display task to print.
+   UART command task — reads lines from stdin (USB-Serial/JTAG = Python
+   visualizer serial port).  Recognised commands:
+     CMD:SYNC  — wake sync_task immediately for an on-demand sync broadcast
    ================================================================ */
 
-static void trilateration_task(void *pvParameters)
+static void uart_cmd_task(void *pvParameters)
 {
-    vTaskDelay(pdMS_TO_TICKS(5000));    /* wait for first reports to arrive */
-
+    char buf[32];
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(TRILAT_PERIOD_MS));
+        if (fgets(buf, sizeof(buf), stdin) == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        /* strip trailing \r\n */
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len-1] == '\r' || buf[len-1] == '\n'))
+            buf[--len] = '\0';
 
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-
-        xSemaphoreTake(s_table_mutex, portMAX_DELAY);
-
-        /* ---- Step 1: rebuild cross-node view from s_nodes[] ---- */
-        s_trilat_count = 0;
-        memset(s_trilat_devices, 0, sizeof(s_trilat_devices));
-
-        for (int n = 0; n < s_node_count; n++) {
-            coord_node_t *node = &s_nodes[n];
-            for (int d = 0; d < node->device_count; d++) {
-                coord_device_t *dev = &node->devices[d];
-
-                /* find or create a trilateration entry for this target MAC */
-                trilat_device_t *te = NULL;
-                for (int t = 0; t < s_trilat_count; t++) {
-                    if (memcmp(s_trilat_devices[t].target_mac, dev->mac, 6) == 0) {
-                        te = &s_trilat_devices[t];
-                        break;
-                    }
-                }
-                if (!te) {
-                    if (s_trilat_count >= MAX_TRILAT_DEVICES) continue;
-                    te = &s_trilat_devices[s_trilat_count++];
-                    memset(te, 0, sizeof(trilat_device_t));
-                    memcpy(te->target_mac, dev->mac, 6);
-                    te->is_random = dev->is_random;
-                    if (dev->ssid[0] != '\0')
-                        strncpy(te->ssid, dev->ssid, 32);
-                }
-
-                /* upsert this node's observation — keep the most recent window */
-                bool updated = false;
-                for (int o = 0; o < te->obs_count; o++) {
-                    if (memcmp(te->obs[o].node_mac, node->node_mac, 6) == 0) {
-                        if (dev->window_id >= te->obs[o].window_id) {
-                            te->obs[o].rssi       = dev->avg_rssi;
-                            te->obs[o].distance_m = rssi_to_distance(dev->avg_rssi);
-                            te->obs[o].window_id  = dev->window_id;
-                        }
-                        updated = true;
-                        break;
-                    }
-                }
-                if (!updated && te->obs_count < MAX_NODES) {
-                    node_observation_t *obs = &te->obs[te->obs_count++];
-                    memcpy(obs->node_mac, node->node_mac, 6);
-                    obs->rssi       = dev->avg_rssi;
-                    obs->distance_m = rssi_to_distance(dev->avg_rssi);
-                    obs->window_id  = dev->window_id;
-                }
+        if (strcmp(buf, "CMD:SYNC") == 0) {
+            ESP_LOGI(TAG, "CMD:SYNC received — triggering immediate sync");
+            printf("CMD_ACK:SYNC\n");
+            fflush(stdout);
+            if (s_sync_task_handle) {
+                xTaskNotifyGive(s_sync_task_handle);
             }
         }
-
-        /* ---- Step 2: run trilateration for eligible devices ---- */
-        int solved = 0;
-
-        for (int t = 0; t < s_trilat_count; t++) {
-            trilat_device_t *te = &s_trilat_devices[t];
-            te->position_valid = false;
-
-            if (te->obs_count < NUM_NODES_EXPECTED) continue;
-
-            /* All observations must fall within WINDOW_TOLERANCE of each other */
-            uint32_t min_wid = te->obs[0].window_id;
-            uint32_t max_wid = te->obs[0].window_id;
-            for (int o = 1; o < te->obs_count; o++) {
-                if (te->obs[o].window_id < min_wid) min_wid = te->obs[o].window_id;
-                if (te->obs[o].window_id > max_wid) max_wid = te->obs[o].window_id;
-            }
-            if ((max_wid - min_wid) > WINDOW_TOLERANCE) continue;
-
-            /* Look up the physical (x, y) for each reporting node */
-            float px[3], py[3], pd[3];
-            bool all_found = true;
-            for (int o = 0; o < NUM_NODES_EXPECTED; o++) {
-                bool found = false;
-                for (int p = 0; p < NUM_NODES_EXPECTED; p++) {
-                    if (memcmp(NODE_POSITIONS[p].mac, te->obs[o].node_mac, 6) == 0) {
-                        px[o] = NODE_POSITIONS[p].x_m;
-                        py[o] = NODE_POSITIONS[p].y_m;
-                        pd[o] = te->obs[o].distance_m;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) { all_found = false; break; }
-            }
-            if (!all_found) continue;
-
-            /* Run algebraic solver */
-            float ex, ey;
-            if (trilaterate_2d(px[0], py[0], pd[0],
-                               px[1], py[1], pd[1],
-                               px[2], py[2], pd[2],
-                               &ex, &ey)) {
-                te->est_x_m         = ex;
-                te->est_y_m         = ey;
-                te->position_valid  = true;
-                te->last_updated_ms = now_ms;
-                solved++;
-            }
-        }
-
-        xSemaphoreGive(s_table_mutex);
-
-        if (solved > 0) {
-            ESP_LOGI(TAG, "Trilateration: %d device(s) positioned this cycle", solved);
-        }
+        /* Unknown commands are silently ignored */
     }
 }
 
 /* ================================================================
-   Display task — prints per-node RSSI table + trilateration results
+   Display task — prints per-node RSSI table and emits machine-readable lines
    ================================================================ */
 
 static void display_task(void *pvParameters)
@@ -692,173 +472,42 @@ static void display_task(void *pvParameters)
             }
         }
 
-        /* ---- Trilateration results ---- */
-        int positioned = 0;
-        for (int t = 0; t < s_trilat_count; t++) {
-            if (s_trilat_devices[t].position_valid) positioned++;
-        }
-
-        printf("\n"
-               "  ┌─ Trilateration  (RSSI_REF=%d dBm  n=%.1f)"
-               "  %d tracked  %d positioned\n",
-               RSSI_REF, PATH_LOSS_EXP, s_trilat_count, positioned);
-
-        if (s_trilat_count == 0) {
-            printf("  │  (waiting for devices seen by all %d nodes in same window)\n",
-                   NUM_NODES_EXPECTED);
-        } else {
-            printf("  │  %-3s  %-17s  %-4s  %-32s  %-10s  %-10s  %-5s\n",
-                   "#", "Device MAC", "RND", "SSID", "X (m)", "Y (m)", "Nodes");
-            printf("  │  ---  -----------------  ----"
-                   "  --------------------------------  ----------  ----------  -----\n");
-
-            for (int t = 0; t < s_trilat_count; t++) {
-                trilat_device_t *te = &s_trilat_devices[t];
-                if (te->position_valid) {
-                    printf("  │  %-3d  %02X:%02X:%02X:%02X:%02X:%02X  %-4s"
-                           "  %-32s  %10.2f  %10.2f  %d\n",
-                           t + 1,
-                           te->target_mac[0], te->target_mac[1], te->target_mac[2],
-                           te->target_mac[3], te->target_mac[4], te->target_mac[5],
-                           te->is_random ? "[R]" : "   ",
-                           te->ssid[0] ? te->ssid : "<hidden>",
-                           te->est_x_m, te->est_y_m,
-                           te->obs_count);
-                } else {
-                    printf("  │  %-3d  %02X:%02X:%02X:%02X:%02X:%02X  %-4s"
-                           "  %-32s  %-10s  %-10s  %d/%d\n",
-                           t + 1,
-                           te->target_mac[0], te->target_mac[1], te->target_mac[2],
-                           te->target_mac[3], te->target_mac[4], te->target_mac[5],
-                           te->is_random ? "[R]" : "   ",
-                           te->ssid[0] ? te->ssid : "<hidden>",
-                           "---", "---",
-                           te->obs_count, NUM_NODES_EXPECTED);
-                }
-            }
-        }
-
         printf("\n"
                "════════════════════════════════════════════════════════════════════\n\n");
 
         /* ---- Machine-readable lines consumed by the Python visualizer ----
          * Format:
-         *   NODE|<idx>|<MAC>|<x_m>|<y_m>
-         *   POS|<MAC>|<is_random>|<x_m>|<y_m>|<ts_ms>|<ssid>
+         *   RSSI|<device_mac>|<is_random>|<ssid>|<node_mac>|<avg_rssi>|<window_id>
          *   DISC|<MAC>            — discovered sniffer node MAC (re-emitted every cycle)
          *   ---FRAME END---
+         * Python performs trilateration using node positions set by dragging.
          * Python splits on '|' with maxsplit=6 so SSIDs may contain '|'.  */
         for (int d = 0; d < s_num_disc; d++) {
             printf("DISC|%02X:%02X:%02X:%02X:%02X:%02X\n",
                    s_disc_macs[d][0], s_disc_macs[d][1], s_disc_macs[d][2],
                    s_disc_macs[d][3], s_disc_macs[d][4], s_disc_macs[d][5]);
         }
-        for (int n = 0; n < NUM_NODES_EXPECTED; n++) {
-            printf("NODE|%d|%02X:%02X:%02X:%02X:%02X:%02X|%.2f|%.2f\n",
-                   n + 1,
-                   NODE_POSITIONS[n].mac[0], NODE_POSITIONS[n].mac[1],
-                   NODE_POSITIONS[n].mac[2], NODE_POSITIONS[n].mac[3],
-                   NODE_POSITIONS[n].mac[4], NODE_POSITIONS[n].mac[5],
-                   NODE_POSITIONS[n].x_m, NODE_POSITIONS[n].y_m);
-        }
-        for (int t = 0; t < s_trilat_count; t++) {
-            trilat_device_t *te = &s_trilat_devices[t];
-            if (te->position_valid) {
-                printf("POS|%02X:%02X:%02X:%02X:%02X:%02X|%d|%.2f|%.2f|%lu|%s\n",
-                       te->target_mac[0], te->target_mac[1],
-                       te->target_mac[2], te->target_mac[3],
-                       te->target_mac[4], te->target_mac[5],
-                       te->is_random ? 1 : 0,
-                       te->est_x_m, te->est_y_m,
-                       (unsigned long)now_ms,
-                       te->ssid[0] ? te->ssid : "<hidden>");
+        for (int n = 0; n < s_node_count; n++) {
+            coord_node_t *node = &s_nodes[n];
+            for (int d = 0; d < node->device_count; d++) {
+                coord_device_t *dev = &node->devices[d];
+                printf("RSSI|%02X:%02X:%02X:%02X:%02X:%02X"
+                       "|%d|%s"
+                       "|%02X:%02X:%02X:%02X:%02X:%02X"
+                       "|%d|%lu\n",
+                       dev->mac[0], dev->mac[1], dev->mac[2],
+                       dev->mac[3], dev->mac[4], dev->mac[5],
+                       dev->is_random ? 1 : 0,
+                       dev->ssid[0] ? dev->ssid : "<hidden>",
+                       node->node_mac[0], node->node_mac[1], node->node_mac[2],
+                       node->node_mac[3], node->node_mac[4], node->node_mac[5],
+                       dev->avg_rssi,
+                       (unsigned long)dev->window_id);
             }
         }
         printf("---FRAME END---\n");
 
         xSemaphoreGive(s_table_mutex);
-    }
-}
-
-/* ================================================================
-   Serial command task — processes config commands sent by the Python
-   visualizer (or any serial terminal) over the USB console.
-
-   Protocol (one command per line, \n terminated):
-     SET_NODE <1-3> <x_m> <y_m>    — update a node anchor position
-   Responses:
-     ACK SET_NODE <idx> <x> <y>    — accepted
-     ERR SET_NODE <reason>         — rejected
-   ================================================================ */
-
-static void serial_cmd_task(void *pvParameters)
-{
-    char line[80];
-    int  pos = 0;
-    int  c;
-
-    setvbuf(stdin, NULL, _IONBF, 0);  /* byte-by-byte; no line-buffer waiting */
-
-    for (;;) {
-        c = getchar();
-        if (c < 0) {                  /* EOF / no USB host attached            */
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-        if (c == '\r') continue;      /* strip CR from CR+LF pairs             */
-
-        if (c == '\n') {
-            if (pos == 0) continue;   /* skip blank lines                      */
-            line[pos] = '\0';
-            pos = 0;
-
-            int   node_idx;
-            float x, y;
-            char  mac_str[20] = {0};
-
-            /* Try new format: SET_NODE <idx> <MAC> <x> <y> */
-            bool mac_provided = false;
-            if (sscanf(line, "SET_NODE %d %19s %f %f",
-                       &node_idx, mac_str, &x, &y) == 4
-                && strchr(mac_str, ':') != NULL) {
-                mac_provided = true;
-            } else if (sscanf(line, "SET_NODE %d %f %f",
-                              &node_idx, &x, &y) != 3) {
-                node_idx = 0;   /* mark as unparsed */
-            }
-
-            if (node_idx >= 1 && node_idx <= NUM_NODES_EXPECTED) {
-                xSemaphoreTake(s_table_mutex, portMAX_DELAY);
-                NODE_POSITIONS[node_idx - 1].x_m = x;
-                NODE_POSITIONS[node_idx - 1].y_m = y;
-
-                if (mac_provided) {
-                    uint8_t mb[6];
-                    if (sscanf(mac_str,
-                               "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                               &mb[0], &mb[1], &mb[2],
-                               &mb[3], &mb[4], &mb[5]) == 6) {
-                        memcpy(NODE_POSITIONS[node_idx - 1].mac, mb, 6);
-                    }
-                }
-                xSemaphoreGive(s_table_mutex);
-
-                if (mac_provided) {
-                    printf("ACK SET_NODE %d %s %.3f %.3f\n",
-                           node_idx, mac_str, x, y);
-                    ESP_LOGI(TAG, "Node %d MAC=%s pos=(%.2f,%.2f)",
-                             node_idx, mac_str, x, y);
-                } else {
-                    printf("ACK SET_NODE %d %.3f %.3f\n", node_idx, x, y);
-                    ESP_LOGI(TAG, "Node %d pos=(%.2f,%.2f)", node_idx, x, y);
-                }
-            } else if (node_idx != 0) {
-                printf("ERR SET_NODE idx %d out of range (1-%d)\n",
-                       node_idx, NUM_NODES_EXPECTED);
-            }
-        } else if (pos < (int)(sizeof(line) - 1)) {
-            line[pos++] = (char)c;
-        }
     }
 }
 
@@ -908,17 +557,15 @@ void app_main(void)
     ESP_LOGI(TAG, " Channel : %d (fixed)", REPORT_CHANNEL);
     ESP_LOGI(TAG, " Sync    : every %d s  (%d broadcasts x %d ms)",
              SYNC_PERIOD_MS / 1000, SYNC_BCAST_COUNT, SYNC_BCAST_INTERVAL_MS);
-    ESP_LOGI(TAG, " Trilat  : RSSI_REF=%d dBm  n=%.1f  nodes=%d",
-             RSSI_REF, PATH_LOSS_EXP, NUM_NODES_EXPECTED);
-    ESP_LOGI(TAG, " -> Update NODE_POSITIONS[] with node MACs and room coordinates");
+    ESP_LOGI(TAG, " RSSI emit: every %d s  — trilateration runs in Python visualizer",
+             DISPLAY_PERIOD_MS / 1000);
     ESP_LOGI(TAG, "========================================");
 
     xTaskCreate(aggregator_task,     "aggregator", 4096, NULL, 5, NULL);
     xTaskCreate(sync_processor_task, "sync_proc",  4096, NULL, 5, NULL);
     xTaskCreate(sync_task,           "sync",       2048, NULL, 4, NULL);
-    xTaskCreate(trilateration_task,  "trilat",     4096, NULL, 3, NULL);
     xTaskCreate(display_task,        "display",    4096, NULL, 2, NULL);
-    xTaskCreate(serial_cmd_task,     "serial_cmd", 3072, NULL, 2, NULL);
+    xTaskCreate(uart_cmd_task,       "uart_cmd",   2048, NULL, 3, NULL);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));

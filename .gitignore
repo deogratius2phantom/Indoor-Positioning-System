@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .pio/
 .vscode/
+tools/visualizer/build/
+tools/visualizer/dist/
+.DS_Store
