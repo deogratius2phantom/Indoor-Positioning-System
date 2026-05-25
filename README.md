@@ -6,33 +6,7 @@ A WiFi-based indoor positioning system using ESP32 microcontrollers and trilater
 
 ## System Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Physical Space                            │
-│                                                                  │
-│   [Sniffer Node 1]     [Sniffer Node 2]     [Sniffer Node 3]    │
-│   ESP32-C3             ESP32-C3             ESP32-C3             │
-│   • Promiscuous sniff  • Promiscuous sniff  • Promiscuous sniff  │
-│   • Channel hopping    • Channel hopping    • Channel hopping    │
-│   • Clock-synced       • Clock-synced       • Clock-synced       │
-│          │  ESP-NOW RSSI reports    │                │           │
-│          └──────────────┬───────────┘                │           │
-│                         │◄──────────────────────────┘           │
-│                  [Coordinator Node]                              │
-│                  ESP32-C3 / ESP32 / ESP32-S3                     │
-│                  • Collects RSSI windows                         │
-│                  • Manages clock sync                            │
-│                  • Emits serial protocol → USB                   │
-│                         │ USB Serial (115200 baud)               │
-└─────────────────────────┼────────────────────────────────────────┘
-                          │
-                   [Host Computer]
-                   IPS Visualizer (.app / .exe)
-                   • Port-picker GUI
-                   • Live trilateration (scipy)
-                   • Draggable anchor node map
-                   • Serial terminal log
-```
+![System Architecture](docs/IPS%20block%20diagram.png)
 
 ---
 
