@@ -1,3 +1,12 @@
-# Fix flash size for DOIT DevKit V1 (4 MB)
+# Fix flash size for ESP32-C3-DevKitM-1 (4 MB)
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# BLE — NimBLE stack (observer/scanner role only, ~60 KB flash vs 150 KB Bluedroid)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=0
+
+# Software CoEx: time-multiplex the shared 2.4 GHz radio between
+# WiFi promiscuous mode and BLE scanning.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y

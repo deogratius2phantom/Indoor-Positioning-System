@@ -16,6 +16,13 @@
 #include "driver/rmt_tx.h"
 #include "led_strip_encoder.h"
 
+/* NimBLE (BLE scanner) */
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "nimble/ble.h"
+#include "host/ble_gap.h"
+
 /* ================================================================
    Configuration
    ================================================================ */
@@ -29,6 +36,16 @@
 #define STALE_MS          30000
 #define RSSI_REF_DBM      (-40)
 #define PATH_LOSS_N       2.5f
+
+/* BLE scanning */
+#define MSG_BLE_REPORT    0x05     /* sniffer → coordinator: BLE advertisement  */
+#define MAX_BLE_DEVICES   64
+#define BLE_STALE_MS      30000
+#define BLE_QUEUE_DEPTH   32
+/* BLE scan timing (units of 0.625 ms):
+   100 ms interval / 50 ms window = 50% duty cycle, leaves room for WiFi CoEx */
+#define BLE_SCAN_ITVL     160
+#define BLE_SCAN_WIN      80
 
 /* Coordinator MAC — replace with actual coordinator MAC once known. */
 static const uint8_t COORDINATOR_MAC[6] = {0x0C, 0x4E, 0xA0, 0x30, 0x97, 0xF8};
@@ -106,6 +123,19 @@ typedef struct {
     uint8_t  msg_type;            /* MSG_SYNC_REQUEST                       */
 } __attribute__((packed)) sync_request_t;
 
+/* Node → coordinator: BLE advertisement report */
+typedef struct {
+    uint8_t  msg_type;            /* MSG_BLE_REPORT                         */
+    uint8_t  sender_mac[6];       /* this sniffer node's MAC                */
+    uint8_t  target_mac[6];       /* BLE advertiser's MAC                   */
+    int8_t   avg_rssi;
+    uint8_t  addr_type;           /* 0 = public, 1 = random                 */
+    char     name[33];            /* BLE device name from adv/scan-response */
+    uint32_t window_id;
+    uint32_t node_timestamp_ms;
+    uint32_t pkt_count;
+} __attribute__((packed)) ble_report_t;
+
 /* ================================================================
    Internal sniffer structures
    ================================================================ */
@@ -136,6 +166,27 @@ typedef struct {
     sync_epoch_t epoch;
     uint32_t     recv_T2_ms;
 } epoch_envelope_t;
+
+/* BLE device tracked by the sniffer */
+typedef struct {
+    uint8_t  mac[6];
+    uint8_t  addr_type;    /* 0=public, 1=random */
+    char     name[33];
+    int8_t   rssi_last;
+    int8_t   rssi_min;
+    int8_t   rssi_max;
+    int32_t  rssi_sum;
+    uint32_t pkt_count;
+    uint32_t last_seen_ms;
+} ble_device_entry_t;
+
+/* Info passed from BLE GAP callback → ble_processor_task */
+typedef struct {
+    uint8_t mac[6];
+    uint8_t addr_type;
+    int8_t  rssi;
+    char    name[33];
+} ble_pkt_info_t;
 
 /* ================================================================
    LED command type
@@ -173,6 +224,12 @@ static volatile uint32_t s_last_sync_ms    = 0;   /* local ms of last sync  */
 /* RMT handles — initialised in app_main, used by set_led() */
 static rmt_channel_handle_t s_led_chan    = NULL;
 static rmt_encoder_handle_t s_led_encoder = NULL;
+
+/* BLE device table */
+static ble_device_entry_t s_ble_devices[MAX_BLE_DEVICES];
+static uint8_t            s_ble_device_count = 0;
+static SemaphoreHandle_t  s_ble_mutex;
+static QueueHandle_t      s_ble_pkt_queue;
 
 /* ================================================================
    802.11 frame structures
@@ -226,6 +283,29 @@ static void parse_ssid_ie(const uint8_t *payload, uint16_t payload_len, char *ou
         }
         ie     += 2 + len;
         offset += 2 + len;
+    }
+}
+
+/* Parse BLE device name from raw advertising data (AD structures).
+   AD type 0x08 = Shortened Local Name, 0x09 = Complete Local Name.  */
+static void parse_ble_name(const uint8_t *data, uint8_t len,
+                           char *out, size_t out_len)
+{
+    out[0] = '\0';
+    if (!data || len == 0) return;
+    uint8_t pos = 0;
+    while (pos < len) {
+        uint8_t field_len = data[pos];
+        if (field_len == 0 || (pos + 1 + field_len) > len) break;
+        uint8_t ad_type = data[pos + 1];
+        if (ad_type == 0x08 || ad_type == 0x09) {
+            size_t name_len = field_len - 1;
+            if (name_len >= out_len) name_len = out_len - 1;
+            memcpy(out, &data[pos + 2], name_len);
+            out[name_len] = '\0';
+            return;
+        }
+        pos += 1 + field_len;
     }
 }
 
@@ -598,6 +678,184 @@ static void device_reporter_task(void *pvParameters)
 
             s_hopper_pause = false;
         }
+
+        /* ---- BLE reporting ----
+           Build ble_report_t entries from the BLE device table and send
+           them over ESP-NOW within the same channel-switched window.     */
+        {
+            static ble_report_t ble_reports[MAX_BLE_DEVICES];
+            int ble_report_count = 0;
+
+            xSemaphoreTake(s_ble_mutex, portMAX_DELAY);
+
+            /* Evict stale BLE entries first */
+            int bi = 0;
+            while (bi < s_ble_device_count) {
+                if ((now_ms - s_ble_devices[bi].last_seen_ms) > BLE_STALE_MS)
+                    s_ble_devices[bi] = s_ble_devices[--s_ble_device_count];
+                else
+                    bi++;
+            }
+
+            for (int bi2 = 0; bi2 < s_ble_device_count; bi2++) {
+                ble_device_entry_t *be = &s_ble_devices[bi2];
+                int8_t ble_avg = (int8_t)(be->rssi_sum / (int32_t)be->pkt_count);
+
+                ble_report_t *br     = &ble_reports[ble_report_count++];
+                br->msg_type         = MSG_BLE_REPORT;
+                memcpy(br->sender_mac, s_self_mac, 6);
+                memcpy(br->target_mac, be->mac, 6);
+                br->avg_rssi         = ble_avg;
+                br->addr_type        = be->addr_type;
+                strncpy(br->name, be->name, sizeof(br->name) - 1);
+                br->name[sizeof(br->name) - 1] = '\0';
+                br->window_id         = window_id;
+                br->node_timestamp_ms = now_ms;
+                br->pkt_count         = be->pkt_count;
+            }
+
+            xSemaphoreGive(s_ble_mutex);
+
+            if (ble_report_count > 0) {
+                s_hopper_pause = true;
+                esp_wifi_set_channel(REPORT_CHANNEL, WIFI_SECOND_CHAN_NONE);
+                vTaskDelay(pdMS_TO_TICKS(10));
+
+                for (int bk = 0; bk < ble_report_count; bk++) {
+                    esp_now_send(COORDINATOR_MAC,
+                                 (const uint8_t *)&ble_reports[bk],
+                                 sizeof(ble_report_t));
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                }
+
+                s_hopper_pause = false;
+                printf("[ble] Sent %d BLE report(s) to coordinator\n",
+                       ble_report_count);
+            }
+        }
+    }
+}
+
+/* ================================================================
+   BLE scanning — GAP event callback, NimBLE init, processor task
+   ================================================================ */
+
+/* Called from the NimBLE host task context for every advertisement seen. */
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+
+    case BLE_GAP_EVENT_DISC: {
+        const struct ble_gap_disc_desc *d = &event->disc;
+
+        ble_pkt_info_t info;
+        /* NimBLE stores BLE addresses LSB-first; reverse to standard notation */
+        info.mac[0] = d->addr.val[5];
+        info.mac[1] = d->addr.val[4];
+        info.mac[2] = d->addr.val[3];
+        info.mac[3] = d->addr.val[2];
+        info.mac[4] = d->addr.val[1];
+        info.mac[5] = d->addr.val[0];
+        info.addr_type = d->addr.type;
+        info.rssi      = d->rssi;
+        parse_ble_name(d->data, d->length_data, info.name, sizeof(info.name));
+
+        /* Non-blocking send — drop if queue full (high-frequency callbacks) */
+        xQueueSend(s_ble_pkt_queue, &info, 0);
+        break;
+    }
+
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+        /* Scan ended (shouldn't happen with BLE_HS_FOREVER, but restart if so) */
+        {
+            struct ble_gap_disc_params p = {
+                .itvl              = BLE_SCAN_ITVL,
+                .window            = BLE_SCAN_WIN,
+                .filter_policy     = 0,
+                .limited           = 0,
+                .passive           = 0,
+                .filter_duplicates = 0,
+            };
+            ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &p,
+                         ble_gap_event_cb, NULL);
+        }
+        break;
+
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* Called by NimBLE when the host stack is synchronised and ready. */
+static void ble_on_sync(void)
+{
+    struct ble_gap_disc_params params = {
+        .itvl              = BLE_SCAN_ITVL,   /* 100 ms */
+        .window            = BLE_SCAN_WIN,    /* 50 ms  */
+        .filter_policy     = 0,               /* no whitelist */
+        .limited           = 0,               /* general discovery */
+        .passive           = 0,               /* active: request scan responses for names */
+        .filter_duplicates = 0,               /* report every advertisement (for RSSI avg) */
+    };
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &params,
+                          ble_gap_event_cb, NULL);
+    if (rc != 0)
+        printf("[ble] ble_gap_disc failed: %d\n", rc);
+    else
+        printf("[ble] Scanning started (interval=%dms window=%dms active)\n",
+               BLE_SCAN_ITVL * 625 / 1000, BLE_SCAN_WIN * 625 / 1000);
+}
+
+/* NimBLE host task — must call nimble_port_run() and never return. */
+static void ble_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();           /* blocks until nimble_port_stop() */
+    nimble_port_freertos_deinit();
+}
+
+/* BLE packet processor task — dequeues BLE advertisements and updates
+   the BLE device table.  Runs at lower priority than WiFi tasks.      */
+static void ble_processor_task(void *pvParameters)
+{
+    ble_pkt_info_t info;
+    while (1) {
+        if (xQueueReceive(s_ble_pkt_queue, &info, portMAX_DELAY) != pdTRUE) continue;
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+
+        xSemaphoreTake(s_ble_mutex, portMAX_DELAY);
+
+        ble_device_entry_t *entry = NULL;
+        for (int i = 0; i < s_ble_device_count; i++) {
+            if (memcmp(s_ble_devices[i].mac, info.mac, 6) == 0) {
+                entry = &s_ble_devices[i];
+                break;
+            }
+        }
+
+        if (entry == NULL && s_ble_device_count < MAX_BLE_DEVICES) {
+            entry = &s_ble_devices[s_ble_device_count++];
+            memset(entry, 0, sizeof(ble_device_entry_t));
+            memcpy(entry->mac, info.mac, 6);
+            entry->addr_type = info.addr_type;
+            entry->rssi_min  = info.rssi;
+            entry->rssi_max  = info.rssi;
+        }
+
+        if (entry) {
+            entry->rssi_last    = info.rssi;
+            entry->rssi_sum    += info.rssi;
+            entry->pkt_count++;
+            entry->last_seen_ms = now_ms;
+            if (info.rssi < entry->rssi_min) entry->rssi_min = info.rssi;
+            if (info.rssi > entry->rssi_max) entry->rssi_max = info.rssi;
+            if (info.name[0] != '\0')
+                strncpy(entry->name, info.name, sizeof(entry->name) - 1);
+        }
+
+        xSemaphoreGive(s_ble_mutex);
     }
 }
 
@@ -665,6 +923,10 @@ void app_main(void)
     s_sync_queue  = xQueueCreate(SYNC_QUEUE_DEPTH, sizeof(epoch_envelope_t));
     s_led_queue   = xQueueCreate(8,                sizeof(led_cmd_t));
 
+    /* BLE structures */
+    s_ble_mutex     = xSemaphoreCreateMutex();
+    s_ble_pkt_queue = xQueueCreate(BLE_QUEUE_DEPTH, sizeof(ble_pkt_info_t));
+
     /* ---- RMT + WS2812 init ---- */
     rmt_tx_channel_config_t tx_chan_cfg = {
         .clk_src           = RMT_CLK_SRC_DEFAULT,
@@ -722,6 +984,13 @@ void app_main(void)
     xTaskCreate(device_reporter_task,  "reporter",    4096, NULL, 3, NULL);
     xTaskCreate(channel_hop_task,      "ch_hop",      2048, NULL, 4, NULL);
     xTaskCreate(sync_watchdog_task,    "sync_wd",     2048, NULL, 5, NULL);
+
+    /* ---- NimBLE init ---- */
+    nimble_port_init();
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    nimble_port_freertos_init(ble_host_task);
+    xTaskCreate(ble_processor_task, "ble_proc", 4096, NULL, 2, NULL);
+    printf("[ble] NimBLE stack started\n");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
